@@ -1,0 +1,17 @@
+[Unit]
+Description=Check for Solar Dashboard updates
+
+[Timer]
+# Hourly, because the install window is a two-hour band chosen in the app rather than a
+# time baked in here. The script decides whether this tick is allowed to install anything;
+# the timer only decides how often it gets to ask.
+OnCalendar=hourly
+# A Pi that was off overnight should still check shortly after it comes back, rather than
+# waiting for the next whole hour.
+Persistent=true
+# Every install in the world firing at :00 is a self-inflicted thundering herd, and it also
+# makes the traffic pattern identifiable. Spread it across the hour.
+RandomizedDelaySec=45m
+
+[Install]
+WantedBy=timers.target

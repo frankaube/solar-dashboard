@@ -1,0 +1,247 @@
+// Data model for Solar Dashboard. SQLite — the core runs single-file so the
+// Lite build can embed everything. Readings store real physical units
+// (V, A, W, Hz, °C, Wh); raw-integer scaling happens at the collector boundary.
+// Timezone-aware daily rollups use the precomputed localDate column (SQLite has
+// no timezone functions).
+
+generator client {
+  provider = "prisma-client-js"
+  // native = this machine; the rest are the Lite-build targets (Windows,
+  // Linux x64, Raspberry Pi arm64) plus the Alpine container.
+  binaryTargets = ["native", "windows", "debian-openssl-3.0.x", "linux-arm64-openssl-3.0.x", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Dtu {
+  id              Int          @id @default(autoincrement())
+  serialNumber    String       @unique
+  host            String
+  model           String?
+  hardwareVersion String?
+  softwareVersion String?
+  createdAt       DateTime     @default(now())
+  inverters       Microinverter[]
+  readings        DtuReading[]
+}
+
+model Microinverter {
+  id           Int               @id @default(autoincrement())
+  dtuId        Int
+  serialNumber BigInt            @unique
+  model        String?
+  portCount    Int
+  firmware     String?
+  createdAt    DateTime          @default(now())
+  dtu          Dtu               @relation(fields: [dtuId], references: [id])
+  ports        PvPort[]
+  readings     InverterReading[]
+}
+
+/// One DC input of a microinverter — corresponds to one physical panel.
+model PvPort {
+  id              Int           @id @default(autoincrement())
+  microinverterId Int
+  portNumber      Int
+  panelLabel      String?
+  panelWattage    Int?
+  gridX           Int?
+  gridY           Int?
+  microinverter   Microinverter @relation(fields: [microinverterId], references: [id])
+  readings        PortReading[]
+
+  @@unique([microinverterId, portNumber])
+}
+
+/// AC-side reading per microinverter per poll.
+model InverterReading {
+  // Int, not BigInt: SQLite only auto-increments INTEGER PRIMARY KEY, and 2^31
+  // rows is centuries of headroom at 5-minute polling.
+  id              Int           @id @default(autoincrement())
+  microinverterId Int
+  takenAt         DateTime
+  gridVoltage     Float
+  gridFrequency   Float
+  activePower     Float
+  reactivePower   Float
+  current         Float
+  powerFactor     Float
+  temperature     Float
+  powerLimitPct   Float?
+  warningNumber   Int?
+  linkStatus      Int?
+  rfSignal        Int?
+  microinverter   Microinverter @relation(fields: [microinverterId], references: [id])
+
+  @@index([microinverterId, takenAt])
+  @@index([takenAt])
+}
+
+/// DC-side reading per panel (PV port) per poll.
+model PortReading {
+  id          Int      @id @default(autoincrement())
+  pvPortId    Int
+  takenAt     DateTime
+  voltage     Float
+  current     Float
+  power       Float
+  energyDaily Int
+  energyTotal BigInt
+  errorCode   BigInt?
+  pvPort      PvPort   @relation(fields: [pvPortId], references: [id])
+
+  @@index([pvPortId, takenAt])
+  @@index([takenAt])
+}
+
+/// System-level rollup per poll. localDate = YYYY-MM-DD in the site timezone,
+/// computed at insert time; daily energy = max(dailyEnergy) grouped by it.
+model DtuReading {
+  id          Int      @id @default(autoincrement())
+  dtuId       Int
+  takenAt     DateTime
+  localDate   String
+  totalPower  Float
+  dailyEnergy Int
+  /// Lifetime accumulator where the gateway reports one (SunSpec WH). Null otherwise.
+  lifetimeEnergy Float?
+  /// Where the row came from: "dtu" for a reading this app polled, "cloud" for one
+  /// imported from a vendor export to fill a collection gap. Never blend the two
+  /// silently — an imported row is somebody else's measurement, and a chart that cannot
+  /// tell them apart is a chart that cannot be audited.
+  source      String   @default("dtu")
+  dtu         Dtu      @relation(fields: [dtuId], references: [id])
+
+  @@index([dtuId, takenAt])
+  @@index([takenAt])
+  @@index([localDate])
+}
+
+/// Configurable settings (electricity price, device hosts, thresholds).
+model Setting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+/// Health alerts raised by the collector's rule engine. Open = closedAt is null.
+model Alert {
+  id         Int       @id @default(autoincrement())
+  type       String
+  severity   String
+  subjectKey String
+  message    String
+  openedAt   DateTime  @default(now())
+  closedAt   DateTime?
+  ackedAt    DateTime?
+
+  @@index([closedAt])
+  @@index([subjectKey])
+}
+
+/// Tesla Wall Connector readings (local /api/1/vitals).
+model ChargerReading {
+  id               Int      @id @default(autoincrement())
+  takenAt          DateTime
+  vehicleConnected Boolean
+  charging         Boolean
+  power            Float
+  sessionEnergyWh  Float
+  gridVoltage      Float
+  handleTemp       Float?
+
+  @@index([takenAt])
+}
+
+/// A discovered/adopted home device (plug, light, thermostat, meter, battery…).
+/// `critical: true` devices are read-only — enforced in the service layer.
+model Device {
+  id         Int             @id @default(autoincrement())
+  vendor     String // kasa | mysa | shelly | …
+  kind       String // switch | light | thermostat | meter | battery | sensor
+  name       String
+  host       String
+  port       Int?
+  hardwareId String? // MAC / HAP id — stable across DHCP changes
+  room       String?
+  critical   Boolean          @default(false)
+  enabled    Boolean          @default(true)
+  config     String? // vendor-specific JSON (e.g. HomeKit pairing keys)
+  createdAt  DateTime         @default(now())
+  readings   DeviceReading[]
+  schedules  DeviceSchedule[]
+
+  @@unique([vendor, hardwareId])
+}
+
+/// Time/sun-based automation for a device. Fires once per local day when its
+/// trigger time passes. Critical devices are never actuated (enforced in code).
+model DeviceSchedule {
+  id          Int      @id @default(autoincrement())
+  deviceId    Int
+  action      String // on | off | setTarget
+  trigger     String // sunrise | sunset | time
+  timeOfDay   String? // HH:MM when trigger = time
+  offsetMin   Int      @default(0) // relative to sunrise/sunset
+  value       Float? // setpoint for setTarget
+  enabled     Boolean  @default(true)
+  lastRunDate String? // YYYY-MM-DD guard
+  createdAt   DateTime @default(now())
+  device      Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId])
+}
+
+/// Generic device telemetry, stored on state changes and heartbeats.
+model DeviceReading {
+  id           Int      @id @default(autoincrement())
+  deviceId     Int
+  takenAt      DateTime
+  /// 0 = the device as a whole. Multi-channel meters (a 3EM's phases/legs, an
+  /// Emporia's circuits) also write one row per channel, numbered from 1.
+  channel      Int      @default(0)
+  on           Boolean?
+  /// Signed on meters: negative means exporting. Do not abs() it — the sign is the
+  /// difference between consuming and selling.
+  powerW       Float?
+  energyWh     Float?
+  /// Energy so far today, where the device reports a resetting daily figure (Daikin).
+  energyTodayWh Float?
+  /// Cumulative energy sent back to the grid, where the meter counts it separately.
+  energyReturnedWh Float?
+  temperatureC Float?
+  setpointC    Float?
+  /// Thermostat call-for-heat. Line-voltage heaters report no power, so duty cycle
+  /// x the element's rated watts is the only local energy estimate available.
+  heating      Boolean?
+  device       Device   @relation(fields: [deviceId], references: [id])
+
+  @@index([deviceId, channel, takenAt])
+}
+
+/// Home battery telemetry (e.g. EcoFlow). powerW > 0 = charging, < 0 = discharging.
+model BatteryReading {
+  id      Int      @id @default(autoincrement())
+  takenAt DateTime
+  soc     Float
+  powerW  Float
+  socLow  Float?
+
+  @@index([takenAt])
+}
+
+/// Local weather (Open-Meteo), stored alongside production for correlation.
+model WeatherReading {
+  id                 Int      @id @default(autoincrement())
+  takenAt            DateTime
+  temperature        Float
+  cloudCover         Int
+  windSpeed          Float?
+  shortwaveRadiation Float?
+  weatherCode        Int?
+
+  @@index([takenAt])
+}

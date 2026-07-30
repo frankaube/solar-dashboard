@@ -1,0 +1,106 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: hoymiles
+      POSTGRES_USER: hoymiles
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hoymiles_dev}
+    ports:
+      # Loopback only. This database has a well-known default password, so publishing
+      # it on 0.0.0.0 would expose it to every device on the LAN.
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hoymiles -d hoymiles"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      # Core data lives in SQLite (Lite-build foundation); Postgres remains only for TeslaMate.
+      DATABASE_URL: file:/data/solar.db
+      # Set both in .env — they are specific to one install, so there is no default.
+      # The device scan finds the DTU if you do not know its address.
+      DTU_HOST: ${DTU_HOST:-}
+      DTU_SERIAL: ${DTU_SERIAL:-}
+      # Site location for the weather forecast. Unset = weather stays off.
+      SITE_LATITUDE: ${SITE_LATITUDE:-}
+      SITE_LONGITUDE: ${SITE_LONGITUDE:-}
+      # Which calendar day a reading counts toward. A container has no timezone of
+      # its own, so leaving this unset buckets every daily total by UTC — set it to
+      # your own IANA zone or "today" will not line up with your utility's day.
+      SITE_TIMEZONE: ${SITE_TIMEZONE:-}
+      # 5 min keeps the DTU's S-Miles cloud uplink alive; 30 s starves it.
+      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-300000}
+      NOTIFY_WEBHOOK_URL: ${NOTIFY_WEBHOOK_URL:-}
+      # Tesla Wall Connector (Gen 3) local API — unset to disable.
+      CHARGER_HOST: ${CHARGER_HOST:-}
+      # Read-only vehicle state from TeslaMate's database.
+      TESLAMATE_DATABASE_URL: postgresql://hoymiles:${POSTGRES_PASSWORD:-hoymiles_dev}@db:5432/teslamate
+      MQTT_URL: ${MQTT_URL:-}
+      MQTT_USERNAME: ${MQTT_USERNAME:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      # Bridge to a self-hosted evcc instance. One setting inherits its whole
+      # ecosystem of vehicle brands and chargers — see docs/ev-support-deepdive.md
+      # for why this beats a cloud OAuth client per car manufacturer.
+      EVCC_URL: ${EVCC_URL:-}
+      # Optional: read evcc over MQTT instead of polling, if a broker is already
+      # running. Sub-second updates, and needs MQTT_URL set too. Default prefix
+      # in evcc is "evcc".
+      EVCC_MQTT_PREFIX: ${EVCC_MQTT_PREFIX:-}
+      # OCPP 1.6J central system. Chargers connect TO us, so this needs no
+      # discovery and works from inside a bridged container. Point the charger at
+      # ws://<this-host>:9000/<any-id>.
+      OCPP_ENABLE: ${OCPP_ENABLE:-}
+      OCPP_PORT: ${OCPP_PORT:-9000}
+      # go-e Charger on the LAN — local HTTP, no cloud account.
+      GOE_HOST: ${GOE_HOST:-}
+      # OVMS dongle publishing to your broker. Needs MQTT_URL as well.
+      OVMS_MQTT_PREFIX: ${OVMS_MQTT_PREFIX:-}
+      API_TOKEN: ${API_TOKEN:-}
+      PORT: 3001
+    ports:
+      - "8080:3001"
+      - "${OCPP_PORT:-9000}:${OCPP_PORT:-9000}"
+    volumes:
+      - solardata:/data
+      # Where in-app backups are written. Point BACKUP_DIR at a USB disk, a NAS
+      # mount, or any folder on another machine this host can reach; the container
+      # can only write to paths mounted into it, so this line is what makes an
+      # off-machine backup possible at all.
+      - ${BACKUP_DIR:-./backups}:/backups
+
+  # Vehicle-side Tesla logging. First run: open http://localhost:4000 and sign in
+  # with Tesla API tokens (see README). Data stays in the local `teslamate` database.
+  teslamate:
+    image: teslamate/teslamate:latest
+    restart: unless-stopped
+    environment:
+      # No default on purpose. This key encrypts your Tesla API tokens in the
+      # database; a shipped default would be a key every install shares. Generate one
+      # with `openssl rand -base64 24` and put it in .env. Changing it later means
+      # re-authenticating TeslaMate.
+      ENCRYPTION_KEY: ${TESLAMATE_ENCRYPTION_KEY:?set TESLAMATE_ENCRYPTION_KEY in .env}
+      DATABASE_USER: hoymiles
+      DATABASE_PASS: ${POSTGRES_PASSWORD:-hoymiles_dev}
+      DATABASE_NAME: teslamate
+      DATABASE_HOST: db
+      DISABLE_MQTT: "true"
+    ports:
+      - "4000:4000"
+    depends_on:
+      db:
+        condition: service_healthy
+    cap_drop:
+      - ALL
+
+volumes:
+  pgdata:
+  solardata:

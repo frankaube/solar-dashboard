@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Nothing here writes anywhere. A CI job for a project whose updater executes signed
+# binaries as root has no business holding a token that can publish one.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests and builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Generated, not committed — every later step needs the client and the engines.
+      - run: pnpm --dir apps/api exec prisma generate
+
+      - run: pnpm --filter api test
+      - run: pnpm --filter web test
+
+      - run: pnpm --filter api build
+      - run: pnpm --filter web build
+
+  updater:
+    name: Updater
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The updater is a root-owned shell script that downloads a binary and replaces a
+      # running service. It cannot be covered by the unit tests, and it is the one piece
+      # where a bug is a security bug — so it gets its own job, run in a container against
+      # a real minisign keypair, forcing each failure path in turn.
+      - name: End-to-end updater suite
+        run: bash scripts/test-updater.sh
+
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse CRLF in anything Linux executes
+        # A shebang followed by a carriage return makes the kernel report "not found" for a
+        # file that is plainly there. It has happened here once already — .gitattributes
+        # fixes checkout, this catches anything that slips past it.
+        run: |
+          bad=0
+          while IFS= read -r file; do
+            if head -c 200 "$file" | grep -q $'\r'; then
+              echo "::error file=$file::contains CR — must be LF only"
+              bad=1
+            fi
+          done < <(git ls-files '*.sh' '*.service' '*.timer')
+          exit $bad
+
+      - name: Parse
+        run: |
+          for file in $(git ls-files '*.sh'); do
+            bash -n "$file" || exit 1
+          done
+
+      - name: shellcheck
+        # Run directly rather than through a third-party action. shellcheck is preinstalled
+        # on the runner, and a project whose updater executes signed binaries as root should
+        # not add a supply-chain dependency to save two lines.
+        #
+        # update.sh and install.sh are POSIX sh, the rest are bash; shellcheck reads the
+        # shebang, so no per-file configuration is needed.
+        run: shellcheck --severity=warning $(git ls-files '*.sh')

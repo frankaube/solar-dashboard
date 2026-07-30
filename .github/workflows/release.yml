@@ -1,0 +1,165 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (must already exist)'
+        required: true
+
+# Every release this produces is a DRAFT, and that is load-bearing rather than cautious.
+#
+# A draft is invisible to the unauthenticated call the updater makes, so a release with no
+# signature on it yet cannot be picked up by any machine. Signing happens on the maintainer's
+# own computer, with a key this workflow has no access to; publishing the draft afterwards is
+# the deliberate act that makes it installable.
+#
+# Three independent things would each have to fail before an unsigned build could install:
+# the draft would have to be published, GitHub would have to serve drafts anonymously, and
+# the updater would have to stop requiring SHA256SUMS.minisig.
+
+permissions:
+  contents: write
+  # For build provenance — see the attest step.
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    name: Build and draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          # The stamp records the commit, so the checkout has to be a real one.
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Tag must match the version in package.json
+        # The updater compares versions to decide whether to replace a running binary. A
+        # release tagged v0.2.0 containing a build stamped 0.1.9 would install and then
+        # immediately offer itself again, forever.
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          version="v$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag $tag does not match package.json ($version)"
+            exit 1
+          fi
+          echo "building $version"
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir apps/api exec prisma generate
+
+      # Tests before artifacts. A release that was never green is worse than a late one.
+      - run: pnpm --filter api test
+      - run: pnpm --filter web test
+
+      - name: Build every target
+        run: node packaging/build.mjs all
+
+      - name: Stamp check
+        # buildInfo() falls back to an honest "dev" when the stamp is missing, and the
+        # updater refuses to replace a build it cannot identify — so an unstamped release
+        # would install once and then never update again.
+        run: |
+          for target in arm64 linux win; do
+            file="packaging/out/$target/version.json"
+            [ -f "$file" ] || { echo "::error::$file missing"; exit 1; }
+            node -e "
+              const s = require('./$file');
+              if (!s.version || !s.commit) { console.error('unstamped: $file'); process.exit(1); }
+              console.log('$target'.padEnd(6), s.version, s.commit);
+            "
+          done
+
+      - name: Package
+        run: node packaging/release.mjs all
+
+      - name: Install the artifact before offering it to anyone
+        # The last thing between a broken release and a fleet of Pis. It signs the real
+        # SHA256SUMS with a throwaway key, runs the real updater against the real tarball,
+        # and checks the install, a tampered copy and a rollback.
+        #
+        # This catches what the unit tests structurally cannot: an archive rooted at the
+        # wrong directory, a missing Prisma engine, a binary that arrives without its
+        # executable bit, a stamp that disagrees with the bundle it is inside.
+        run: bash scripts/test-release-artifact.sh
+
+      - name: Provenance
+        # A Sigstore-backed statement that these exact bytes came out of this workflow, at
+        # this commit. It does not replace the minisign signature — that is a human saying
+        # "I meant to release this" — but it does let anyone check that the artifacts are
+        # what CI produced rather than something uploaded afterwards:
+        #
+        #   gh attestation verify solar-dashboard-arm64.tar.gz -R frankaube/solar-dashboard
+        #
+        # Worth having precisely because the build is not bit-for-bit reproducible, so
+        # rebuilding locally cannot prove the same thing.
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'packaging/out/*.tar.gz'
+
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          {
+            echo "## Not installable yet"
+            echo ""
+            echo "This draft has no \`SHA256SUMS.minisig\`. Until one is attached and the"
+            echo "release is published, no installation will accept it — the updater requires"
+            echo "a signature verified against a configured key, and refuses anything without"
+            echo "one. That refusal is the point, not a bug to work around."
+            echo ""
+            echo "To finish, on the machine holding the signing key:"
+            echo ""
+            echo '```bash'
+            echo "gh release download $TAG -p SHA256SUMS -R ${{ github.repository }}"
+            echo "minisign -Sm SHA256SUMS"
+            echo "gh release upload $TAG SHA256SUMS.minisig -R ${{ github.repository }}"
+            echo "gh release edit $TAG --draft=false -R ${{ github.repository }}"
+            echo '```'
+            echo ""
+            echo "## Checksums"
+            echo ""
+            echo '```'
+            cat packaging/out/SHA256SUMS
+            echo '```'
+            echo ""
+            echo "Built from \`${{ github.sha }}\`."
+          } > notes.md
+
+          gh release create "$TAG" \
+            --draft \
+            --title "$TAG" \
+            --notes-file notes.md \
+            packaging/out/*.tar.gz \
+            packaging/out/SHA256SUMS
+
+      - name: Say what happens next
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          {
+            echo "### Draft release $TAG created"
+            echo ""
+            echo "It is **not** installable. Sign \`SHA256SUMS\` locally, upload the"
+            echo "\`.minisig\`, then publish the draft."
+            echo ""
+            echo '```'
+            cat packaging/out/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
