@@ -31,17 +31,17 @@ jobs:
     name: Build and draft
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
           # The stamp records the commit, so the checkout has to be a real one.
           fetch-depth: 0
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -107,7 +107,7 @@ jobs:
         #
         # Worth having precisely because the build is not bit-for-bit reproducible, so
         # rebuilding locally cannot prove the same thing.
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: 'packaging/out/*.tar.gz'
 

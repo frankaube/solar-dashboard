@@ -20,13 +20,13 @@ jobs:
     name: Tests and builds
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -46,7 +46,7 @@ jobs:
     name: Updater
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The updater is a root-owned shell script that downloads a binary and replaces a
       # running service. It cannot be covered by the unit tests, and it is the one piece
@@ -59,7 +59,7 @@ jobs:
     name: Shell scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Refuse CRLF in anything Linux executes
         # A shebang followed by a carriage return makes the kernel report "not found" for a
