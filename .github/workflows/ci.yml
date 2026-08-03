@@ -20,14 +20,14 @@ jobs:
     name: Tests and builds
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         # No version here on purpose. It comes from "packageManager" in package.json, which
         # is what corepack reads locally — one source, so CI cannot silently run a different
         # pnpm from the one a contributor has. Specifying both is a hard error in v4.
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -47,7 +47,7 @@ jobs:
     name: Updater
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The updater is a root-owned shell script that downloads a binary and replaces a
       # running service. It cannot be covered by the unit tests, and it is the one piece
@@ -69,7 +69,7 @@ jobs:
 
       - name: Keep the output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: updater-output
           path: updater-output.txt
@@ -79,7 +79,7 @@ jobs:
     name: Shell scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Refuse CRLF in anything Linux executes
         # A shebang followed by a carriage return makes the kernel report "not found" for a
