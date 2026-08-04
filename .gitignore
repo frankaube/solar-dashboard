@@ -1,0 +1,26 @@
+node_modules/
+dist/
+.env
+*.log
+*.tsbuildinfo
+data/
+packaging/out/
+# Third-party binary fetched by build-installer.mjs, not ours to vendor into git.
+packaging/vendor/
+dist-lite/
+
+# Default in-app backup target (BACKUP_DIR in .env). Snapshots of your own
+# database — never someone else's to check in.
+/backups/
+
+# Never published — see scripts/publish.sh
+.publish-deny
+
+# Written by packaging/build.mjs into the bundle; a stray one in apps/api is a test
+# leftover or a mistake, never something to commit.
+/apps/api/version.json
+
+# Staged there only by the packager and by tests that need the Lite layout; the real
+# ones live in apps/api/prisma/migrations.
+/apps/api/migrations/
+.social-card.html
