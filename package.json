@@ -1,0 +1,20 @@
+{
+  "name": "solar-dashboard",
+  "version": "0.1.3",
+  "description": "Local-first dashboard for home solar, EV charging and smart plugs. No account, no cloud.",
+  "license": "AGPL-3.0-or-later",
+  "author": "Frank Aubé",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/frankaube/solar-dashboard.git"
+  },
+  "homepage": "https://github.com/frankaube/solar-dashboard#readme",
+  "bugs": {
+    "url": "https://github.com/frankaube/solar-dashboard/issues"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "packageManager": "pnpm@9.0.0"
+}

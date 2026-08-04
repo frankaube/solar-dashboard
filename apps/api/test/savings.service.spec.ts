@@ -1,0 +1,480 @@
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { SavingsService } from '../src/readings/savings.service';
+import { localDateOf } from '../src/common/localdate';
+
+/**
+ * The savings model has two invariants worth pinning:
+ *   gross     === netMeteringCredit + bonusCaptured + bonusForegone
+ *   realized  === netMeteringCredit + bonusCaptured
+ * plus: self-consumption can never exceed production, and it must be summed over the SAME
+ * calendar buckets as production (the rolling-window mismatch is what this suite exists to
+ * catch — the previous version's mock ignored the window argument and could not).
+ */
+
+interface Opts {
+  todayWh: number;
+  monthWh?: number;
+  lifetimeWh: number;
+  retail: number;
+  hst: number;
+  /** Charge sessions as [ISO start, solar Wh]. */
+  sessions?: Array<[string, number]>;
+  /** Battery samples as [ISO instant, watts] — negative watts = discharging. */
+  battery?: Array<[string, number]>;
+  /**
+   * Mains-clamp samples as [ISO instant, signed watts] — negative watts = exporting.
+   *
+   * Present at all means a device holds the `mains` role. Absent means none does, which
+   * is a different answer from a clamp that measured nothing.
+   */
+  mains?: Array<[string, number]>;
+  /** Days the array produced, as [YYYY-MM-DD, Wh]. Defaults to today alone. */
+  daily?: Array<[string, number]>;
+  /** The owner's typed-in share, which a mains clamp is supposed to make unnecessary. */
+  selfConsumptionPct?: number;
+  /** Exported kWh by date, as imported from the utility's own usage export. */
+  utilityExport?: Record<string, number>;
+  systemCostCad?: number | null;
+}
+
+function makeService(opts: Opts): SavingsService {
+  const readings = {
+    getEnergyStats: async () => ({
+      todayWh: opts.todayWh,
+      monthWh: opts.monthWh ?? opts.lifetimeWh,
+      yearWh: opts.lifetimeWh,
+      lifetimeWh: opts.lifetimeWh,
+      systemCostCad: opts.systemCostCad === undefined ? 60000 : opts.systemCostCad,
+    }),
+    getConfig: async () => ({
+      electricityPricePerKwh: opts.retail,
+      systemCostCad: opts.systemCostCad === undefined ? 60000 : opts.systemCostCad,
+      hstRate: opts.hst,
+      selfConsumptionPct: opts.selfConsumptionPct,
+    }),
+    /*
+      Which days the array actually produced on. Only consulted to decide whether a mains
+      clamp covers a period, so cases with no clamp can leave it at today alone.
+    */
+    getDailyEnergy: async () =>
+      (opts.daily ?? [[localDateOf(new Date()), opts.todayWh]]).map(([date, energyWh]) => ({
+        date,
+        energyWh,
+      })),
+  };
+  const charger = {
+    getSessions: async () => ({
+      sessions: (opts.sessions ?? []).map(([startedAt, solarWh]) => ({
+        startedAt,
+        endedAt: startedAt,
+        energyWh: solarWh,
+        solarWh,
+        solarPct: 100,
+        peakW: 0,
+      })),
+      totals: { energyWh: 0, solarWh: 0, solarPct: 0 },
+    }),
+  };
+  const prisma = {
+    batteryReading: {
+      findMany: async () =>
+        (opts.battery ?? []).map(([takenAt, powerW]) => ({ takenAt: new Date(takenAt), powerW })),
+    },
+    /*
+      A mains clamp, when the case declares one. `opts.mains` undefined means no device
+      holds the role — which is a different answer from a clamp that measured no export,
+      and the service must fall back to the estimate rather than conclude everything was
+      used at home.
+    */
+    device: {
+      findFirst: async () => (opts.mains ? { id: 1 } : null),
+    },
+    deviceReading: {
+      findMany: async () =>
+        (opts.mains ?? []).map(([takenAt, powerW]) => ({ takenAt: new Date(takenAt), powerW })),
+    },
+  };
+  /*
+    The utility's own meter, when the case supplies one. An empty map means nothing has
+    been imported and the clamp — or the estimate — decides, which is every case here
+    except the ones that say otherwise.
+  */
+  const utility = {
+    exportedKwhByDate: async () => new Map(Object.entries(opts.utilityExport ?? {})),
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return new SavingsService(prisma as any, readings as any, charger as any, utility as any);
+}
+
+/** An ISO instant `hoursAgo` before now — used to place charges in specific local days. */
+const ago = (hoursAgo: number): string => new Date(Date.now() - hoursAgo * 3600_000).toISOString();
+const agoMin = (minutesAgo: number): string => new Date(Date.now() - minutesAgo * 60_000).toISOString();
+
+/**
+ * The same, but never stepping out of the local day — for tests that assert about "today".
+ *
+ * `ago(1)` is only inside today if it is past 01:00 locally, so these tests passed all day
+ * and failed for the first few hours after local midnight. CI happened to run at 00:45 UTC
+ * on a machine resolving to UTC, and three of them went red on a suite that had been green
+ * for days. The service was right the whole time: it buckets by local date, and the
+ * fixture was placing the event in yesterday.
+ *
+ * Walks forward rather than computing the local midnight instant, because that needs zone
+ * arithmetic and this needs none: now is inside today by definition, so stepping toward it
+ * terminates.
+ */
+const withinToday = (minutesAgo: number): Date => {
+  const now = Date.now();
+  const day = localDateOf(new Date(now));
+  let t = now - minutesAgo * 60_000;
+  while (localDateOf(new Date(t)) !== day) t += 60_000;
+  return new Date(t);
+};
+const isoWithinToday = (minutesAgo: number): string => withinToday(minutesAgo).toISOString();
+
+/*
+  Read off the programme, via the marginal value of a kWh.
+
+  The first attempt looked for a rule that applies to "exported" and found nothing:
+  net metering credits *produced* at the pre-tax rate and adds the tax back only for
+  self-consumption, so exporting looked worthless when it is worth retail/(1+tax).
+  marginalValue() folds produced-rules into both sides, which is the only reading that
+  survives changing programme.
+*/
+const exportRate = (r: { rates: { marginal: { exportedPerKwh: number } } }) =>
+  r.rates.marginal.exportedPerKwh;
+const premiumRate = (r: {
+  rates: { marginal: { selfConsumedPerKwh: number; exportedPerKwh: number } };
+}) => r.rates.marginal.selfConsumedPerKwh - r.rates.marginal.exportedPerKwh;
+
+/*
+  Pinned to the hour that broke this.
+
+  These assertions are about "today", and the fixtures place events a few hours back. That
+  is inside today for most of the day and outside it just after local midnight — so the
+  suite was green for days and went red the one night CI ran at 00:45 UTC. Freezing the
+  clock at 00:30 UTC means every run from now on is that night: west of Greenwich the
+  local day is still yesterday, and any fixture that steps back an hour lands in it.
+*/
+beforeAll(() => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(new Date('2026-08-04T00:30:00Z'));
+});
+afterAll(() => vi.useRealTimers());
+
+describe("SavingsService.getSavings", () => {
+  it('derives rates: exported worth retail / (1 + HST), premium is the HST gap', async () => {
+    const s = await makeService({ todayWh: 0, lifetimeWh: 1_000_000, retail: 0.16, hst: 0.15 }).getSavings();
+    // Read off the programme now, not off two net-metering-shaped DTO fields.
+    expect(exportRate(s)).toBeCloseTo(0.16 / 1.15, 5);
+    expect(premiumRate(s)).toBeCloseTo(0.16 - 0.16 / 1.15, 5);
+  });
+
+  it('splits gross value cleanly into credit + captured + foregone', async () => {
+    const s = await makeService({
+      todayWh: 0,
+      lifetimeWh: 5_000_000,
+      retail: 0.16,
+      hst: 0.15,
+      sessions: [[ago(2), 5000]],
+    }).getSavings();
+    const { grossValue, netMeteringValue, bonusCaptured, bonusForegone, realizedSaved } = s.lifetime;
+    expect(netMeteringValue + bonusCaptured + bonusForegone).toBeCloseTo(grossValue, 4);
+    expect(realizedSaved).toBeCloseTo(netMeteringValue + bonusCaptured, 4);
+    expect(s.lifetime.selfConsumedKwh).toBeCloseTo(5, 3);
+    expect(s.lifetime.exportedKwh).toBeCloseTo(4995, 1);
+  });
+
+  // The regression test for the rolling-vs-calendar bug: a charge that happened
+  // yesterday must not be attributed to today, or "today" reports a fake 100%.
+  it('attributes self-consumption to the calendar day it happened on', async () => {
+    const s = await makeService({
+      todayWh: 4_000, // 4 kWh produced so far today
+      lifetimeWh: 100_000,
+      retail: 0.16,
+      hst: 0.15,
+      sessions: [[ago(30), 28_000]], // 28 kWh of solar charging — yesterday
+    }).getSavings();
+    // Yesterday's charge must NOT land in today's bucket.
+    expect(s.today.selfConsumedKwh).toBe(0);
+    expect(s.today.selfConsumptionPct).toBe(0);
+    expect(s.today.exportedKwh).toBeCloseTo(4, 3);
+    expect(s.today.bonusForegone).toBeGreaterThan(0);
+    // It is still counted over the lifetime window.
+    expect(s.lifetime.selfConsumedKwh).toBeCloseTo(28, 3);
+  });
+
+  it('counts a charge that happened today in today’s bucket', async () => {
+    const s = await makeService({
+      todayWh: 10_000,
+      lifetimeWh: 10_000,
+      retail: 0.16,
+      hst: 0.15,
+      sessions: [[isoWithinToday(60), 6_000]],
+    }).getSavings();
+    expect(s.today.selfConsumedKwh).toBeCloseTo(6, 3);
+    expect(s.today.selfConsumptionPct).toBe(60);
+  });
+
+  it('integrates battery discharge only, ignoring charging', async () => {
+    // Samples at the real 60 s poll cadence. Discharging 2 kW across six 1-minute
+    // intervals = 2000 W x 0.1 h = 0.2 kWh; the charging samples must contribute nothing.
+    const base = withinToday(3 * 60).getTime();
+    const at = (i: number): string => new Date(base + i * 60_000).toISOString();
+    const battery: Array<[string, number]> = [];
+    for (let i = 0; i <= 6; i++) battery.push([at(i), -2000]);
+    for (let i = 7; i <= 10; i++) battery.push([at(i), 3000]); // charging
+    const s = await makeService({
+      todayWh: 20_000,
+      lifetimeWh: 20_000,
+      retail: 0.16,
+      hst: 0.15,
+      battery,
+    }).getSavings();
+    expect(s.measured.batteryDischargeKwhLifetime).toBeCloseTo(0.2, 2);
+    expect(s.today.selfConsumedKwh).toBeCloseTo(0.2, 2);
+  });
+
+  it('does not integrate across a long gap in battery samples', async () => {
+    // A two-hour hole between samples must not be counted as two hours of discharge —
+    // MAX_SAMPLE_GAP_MS caps each interval at 10 minutes.
+    const s = await makeService({
+      todayWh: 20_000,
+      lifetimeWh: 20_000,
+      retail: 0.16,
+      hst: 0.15,
+      battery: [
+        [agoMin(180), -2000],
+        [agoMin(60), -2000],
+      ],
+    }).getSavings();
+    // 2000 W capped at a 10-minute interval = 0.333 kWh, surfaced rounded to 1 dp.
+    expect(s.measured.batteryDischargeKwhLifetime).toBeCloseTo(0.3, 2);
+  });
+
+  it('caps self-consumption at production without silently claiming 100%', async () => {
+    // Over-claiming is clamped so the identities hold, but this should be rare now that
+    // the buckets align — it is a guard, not the normal path.
+    const s = await makeService({
+      todayWh: 1000,
+      lifetimeWh: 1_000_000,
+      retail: 0.16,
+      hst: 0.15,
+      sessions: [[isoWithinToday(60), 5000]],
+    }).getSavings();
+    expect(s.today.selfConsumedKwh).toBeCloseTo(1, 3);
+    expect(s.today.exportedKwh).toBeCloseTo(0, 3);
+    expect(s.today.grossValue).toBeCloseTo(
+      s.today.netMeteringValue + s.today.bonusCaptured + s.today.bonusForegone,
+      6,
+    );
+  });
+
+  it('handles a zero tax rate without dividing by zero', async () => {
+    const s = await makeService({ todayWh: 0, lifetimeWh: 1_000_000, retail: 0.16, hst: 0 }).getSavings();
+    expect(exportRate(s)).toBeCloseTo(0.16, 6);
+    expect(premiumRate(s)).toBeCloseTo(0, 6);
+    expect(s.lifetime.bonusForegone).toBeCloseTo(0, 6);
+    expect(s.lifetime.realizedSaved).toBeCloseTo(s.lifetime.grossValue, 6);
+  });
+
+  it('rejects a nonsensical stored tax rate instead of emitting NaN/Infinity', async () => {
+    const s = await makeService({ todayWh: 0, lifetimeWh: 1_000_000, retail: 0.16, hst: -1 }).getSavings();
+    expect(s.rates.perKwh.every((r) => Number.isFinite(r.ratePerKwh))).toBe(true);
+    expect(Number.isFinite(s.lifetime.grossValue)).toBe(true);
+    expect(Number.isFinite(s.lifetime.realizedSaved)).toBe(true);
+  });
+
+  it('produces a coherent zero-production period', async () => {
+    const s = await makeService({ todayWh: 0, lifetimeWh: 0, retail: 0.16, hst: 0.15 }).getSavings();
+    expect(s.today.producedKwh).toBe(0);
+    expect(s.today.selfConsumptionPct).toBe(0);
+    expect(s.today.grossValue).toBe(0);
+    expect(s.today.realizedSaved).toBe(0);
+  });
+
+  it('bases payback on gross lifetime value and tolerates a missing system cost', async () => {
+    const s = await makeService({ todayWh: 0, lifetimeWh: 5_000_000, retail: 0.16, hst: 0.15 }).getSavings();
+    expect(s.lifetime.grossValue).toBeCloseTo(800, 2);
+    expect(s.paybackProgressPct).toBeCloseTo((800 / 60000) * 100, 4);
+
+    const none = await makeService({
+      todayWh: 0,
+      lifetimeWh: 5_000_000,
+      retail: 0.16,
+      hst: 0.15,
+      systemCostCad: null,
+    }).getSavings();
+    expect(none.paybackProgressPct).toBeNull();
+  });
+});
+
+/*
+  A clamp on the service entrance is the difference between this app's savings figures
+  being a measurement and being a percentage somebody typed in. These pin the handover.
+*/
+describe('SavingsService with a mains clamp', () => {
+  const today = () => localDateOf(new Date());
+
+  /**
+   * Twenty minutes of samples at a steady signed wattage, five minutes apart.
+   *
+   * Twenty and not a hundred and twenty, and the difference is the whole reason this
+   * suite pins its clock. At 00:30 UTC only thirty minutes of "today" have happened in a
+   * UTC-based run, so a two-hour fixture gets clamped forward by `withinToday` into a heap
+   * at local midnight and integrates to a quarter of what it should. West of Greenwich the
+   * local day is still yesterday with twenty-one hours of room, so it looked fine here and
+   * failed in CI — the same asymmetry the pinned clock was introduced to catch, walked
+   * into again by a new fixture.
+   *
+   * Thirty minutes is the floor across every timezone at that instant, so twenty always
+   * fits and the arithmetic below is the same everywhere.
+   */
+  const steadyMinutes = 20;
+  const steady = (watts: number): Array<[string, number]> => {
+    const samples: Array<[string, number]> = [];
+    for (let minutesAgo = steadyMinutes; minutesAgo >= 0; minutesAgo -= 5) {
+      samples.push([isoWithinToday(minutesAgo), watts]);
+    }
+    return samples;
+  };
+
+  it('measures self-consumption instead of assuming it', async () => {
+    /*
+      Twenty minutes exporting a steady 6 kW is 2 kWh out of the property. Against 30 kWh
+      produced, 28 kWh stayed home — and nothing about that came from a typed-in share.
+    */
+    const s = await makeService({
+      todayWh: 30_000,
+      lifetimeWh: 30_000,
+      retail: 0.16,
+      hst: 0.15,
+      mains: steady(-6000),
+      daily: [[today(), 30_000]],
+    }).getSavings();
+    expect(s.today.selfConsumedKwh).toBeCloseTo(28, 1);
+    expect(s.today.exportedKwh).toBeCloseTo(2, 1);
+    expect(s.today.selfConsumptionEstimated).toBe(false);
+  });
+
+  it('does not claim everything was used at home when nobody installed a clamp', async () => {
+    /*
+      The distinction the null return exists for. No device holding the role is not the
+      same answer as a clamp that measured no export, and collapsing them would report
+      100% self-consumption on every install that has never seen a meter.
+    */
+    const s = await makeService({
+      todayWh: 30_000,
+      lifetimeWh: 30_000,
+      retail: 0.16,
+      hst: 0.15,
+    }).getSavings();
+    expect(s.today.selfConsumedKwh).toBeLessThan(30);
+  });
+
+  it('believes a clamp that genuinely measured no export', async () => {
+    // A day of steady import while producing: it really did all go into the house.
+    const s = await makeService({
+      todayWh: 12_000,
+      lifetimeWh: 12_000,
+      retail: 0.16,
+      hst: 0.15,
+      mains: steady(900),
+      daily: [[today(), 12_000]],
+    }).getSavings();
+    expect(s.today.selfConsumedKwh).toBeCloseTo(12, 1);
+    expect(s.today.exportedKwh).toBeCloseTo(0, 1);
+    expect(s.today.selfConsumptionEstimated).toBe(false);
+  });
+
+  it('will not let a clamp fitted today rewrite the years before it', async () => {
+    /*
+      The trap this whole coverage check exists for. Subtracting a new meter's exports
+      from a lifetime total would report every pre-clamp kWh as used at home — turning the
+      most cautious figure in the app into its most overstated one, silently, on the day
+      the hardware is installed.
+    */
+    const s = await makeService({
+      todayWh: 30_000,
+      monthWh: 30_000,
+      lifetimeWh: 900_000,
+      retail: 0.16,
+      hst: 0.15,
+      selfConsumptionPct: 30,
+      mains: steady(-6000),
+      daily: [
+        ['2025-06-15', 40_000], // long before the clamp existed
+        [today(), 30_000],
+      ],
+    }).getSavings();
+
+    expect(s.today.selfConsumptionEstimated).toBe(false);
+    // Lifetime spans a day the clamp never saw, so it falls back to the owner's 30% —
+    // 270 kWh — rather than reporting 890 of 900 kWh as used at home.
+    expect(s.lifetime.selfConsumptionEstimated).toBe(true);
+    expect(s.lifetime.selfConsumedKwh).toBeCloseTo(270, 0);
+  });
+
+  it('lets the utility s own meter outrank a clamp', async () => {
+    /*
+      Both measure the same boundary, but only one is what the bill is calculated from.
+      Here the clamp says 2 kWh left and the utility says 9 — and the utility wins, because
+      where they disagree the money follows the meter.
+    */
+    const s = await makeService({
+      todayWh: 30_000,
+      lifetimeWh: 30_000,
+      retail: 0.16,
+      hst: 0.15,
+      selfConsumptionPct: 30,
+      mains: steady(-6000),
+      utilityExport: { [today()]: 9 },
+      daily: [[today(), 30_000]],
+    }).getSavings();
+    expect(s.today.selfConsumedKwh).toBeCloseTo(21, 1);
+    expect(s.today.selfConsumptionEstimated).toBe(false);
+  });
+
+  it('falls back to the estimate for a day the meter was not counting export', async () => {
+    /*
+      The case this whole import exists for: four days when the array produced and the
+      meter recorded no export, because net metering had not been activated. Such days are
+      absent from the map rather than present as zero — zero would read as "all of it
+      stayed home", crediting the house with energy it actually gave away, on exactly the
+      days its owner was being short-changed.
+    */
+    const s = await makeService({
+      todayWh: 30_000,
+      lifetimeWh: 30_000,
+      retail: 0.16,
+      hst: 0.15,
+      selfConsumptionPct: 30,
+      utilityExport: { '2026-07-27': 83 }, // a different day; today is unmetered
+      daily: [[today(), 30_000]],
+    }).getSavings();
+    expect(s.today.selfConsumptionEstimated).toBe(true);
+    expect(s.today.selfConsumedKwh).toBeCloseTo(9, 1);
+  });
+
+  it('ignores a gap in the clamp record rather than crediting it', async () => {
+    /*
+      Two readings fifteen minutes apart is not fifteen minutes of measured export — the
+      allowance is ten. Both sit inside the twenty minutes of "today" that exist in every
+      timezone under the pinned clock, so this tests the gap rule rather than accidentally
+      testing two timestamps that got clamped onto each other.
+    */
+    const s = await makeService({
+      todayWh: 30_000,
+      lifetimeWh: 30_000,
+      retail: 0.16,
+      hst: 0.15,
+      selfConsumptionPct: 30,
+      mains: [[isoWithinToday(20), -6000], [isoWithinToday(5), -6000]],
+      daily: [[today(), 30_000]],
+    }).getSavings();
+    // The pair spans more than the allowed gap, so nothing is integrated and the day has
+    // no mains coverage at all — the owner's estimate, not a fabricated 5 kWh export.
+    expect(s.today.selfConsumptionEstimated).toBe(true);
+    expect(s.today.selfConsumedKwh).toBeCloseTo(9, 1);
+  });
+});

@@ -1,0 +1,40 @@
+version: 2
+
+# Grouped, and weekly rather than daily, on purpose.
+#
+# A single-maintainer project drowns in per-dependency PRs and then stops reading any of
+# them, which is worse than not having the alerts — the security updates end up buried in
+# the same pile as a patch bump to a type definition. Grouping keeps the queue to a couple
+# of PRs a week, and security updates are ungrouped so they arrive on their own and are
+# obvious.
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      # Major bumps stay separate: those need reading, and burying one in a group of
+      # fifteen patches is how a breaking change gets merged unnoticed.
+      minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      # pkg is archived upstream and pinned deliberately — the Lite build depends on its
+      # exact snapshot behaviour, and there is no newer version to move to.
+      - dependency-name: pkg
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ['*']
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
