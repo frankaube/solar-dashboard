@@ -1,0 +1,27 @@
+[Unit]
+Description=Solar Dashboard - local solar, EV and home energy monitoring
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/solar-dashboard
+ExecStart=/opt/solar-dashboard/solar-dashboard
+Restart=on-failure
+RestartSec=10
+User=solar
+Environment=PORT=3001
+# The same root-owned file the updater reads, so UPDATE_REPO is configured once.
+#
+# Without this the app cannot see the release feed while the updater can: setting
+# UPDATE_REPO exactly as documented left Settings → Updates reporting "No update source
+# configured" and checking nothing, while the systemd timer beside it was configured
+# correctly. One setting, two components, and only one of them could see it.
+#
+# The leading `-` makes the file optional, so a Docker or from-source install that has no
+# /etc/solar-dashboard still starts. Importing it is safe because the app keys its data
+# path off SOLAR_DATA_DIR, not the DATA_DIR this file sets for the updater.
+EnvironmentFile=-/etc/solar-dashboard/update.conf
+
+[Install]
+WantedBy=multi-user.target

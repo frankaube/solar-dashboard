@@ -1,0 +1,11 @@
+-- Lifetime production counter, where the gateway reports one.
+--
+-- SunSpec inverters publish ONLY a lifetime accumulator (model 1xx "WH") and no
+-- daily counter, so dailyEnergy is always 0 for them and a SunSpec user would see a
+-- blank daily figure forever. Storing the accumulator lets the day be derived as
+-- last-minus-first, the same treatment the DTU's own counter already gets.
+--
+-- Nullable and unbackfilled on purpose: sources that report a real daily counter
+-- (Hoymiles, Fronius, OpenDTU) leave this empty, and an empty column is honest about
+-- history recorded before it existed.
+ALTER TABLE "DtuReading" ADD COLUMN "lifetimeEnergy" REAL;
