@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up TeslaMate's Postgres
+# Pointless before Docker is up, and a failure at boot would look like a real fault.
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/teslamate/backup.sh
+User=root
+# Exits 0 when TeslaMate is not installed, so this is only a real failure.

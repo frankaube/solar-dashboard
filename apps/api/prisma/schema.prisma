@@ -1,0 +1,360 @@
+// Data model for Solar Dashboard. SQLite — the core runs single-file so the
+// Lite build can embed everything. Readings store real physical units
+// (V, A, W, Hz, °C, Wh); raw-integer scaling happens at the collector boundary.
+// Timezone-aware daily rollups use the precomputed localDate column (SQLite has
+// no timezone functions).
+
+generator client {
+  provider = "prisma-client-js"
+  // native = this machine; the rest are the Lite-build targets (Windows,
+  // Linux x64, Raspberry Pi arm64) plus the Alpine container.
+  binaryTargets = ["native", "windows", "debian-openssl-3.0.x", "linux-arm64-openssl-3.0.x", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Dtu {
+  id              Int          @id @default(autoincrement())
+  serialNumber    String       @unique
+  host            String
+  model           String?
+  hardwareVersion String?
+  softwareVersion String?
+  createdAt       DateTime     @default(now())
+  inverters       Microinverter[]
+  readings        DtuReading[]
+}
+
+model Microinverter {
+  id           Int               @id @default(autoincrement())
+  dtuId        Int
+  serialNumber BigInt            @unique
+  model        String?
+  portCount    Int
+  firmware     String?
+  createdAt    DateTime          @default(now())
+  dtu          Dtu               @relation(fields: [dtuId], references: [id])
+  ports        PvPort[]
+  readings     InverterReading[]
+}
+
+/// One DC input of a microinverter — corresponds to one physical panel.
+model PvPort {
+  id              Int           @id @default(autoincrement())
+  microinverterId Int
+  portNumber      Int
+  panelLabel      String?
+  panelWattage    Int?
+  gridX           Int?
+  gridY           Int?
+  microinverter   Microinverter @relation(fields: [microinverterId], references: [id])
+  readings        PortReading[]
+
+  @@unique([microinverterId, portNumber])
+}
+
+/// AC-side reading per microinverter per poll.
+model InverterReading {
+  // Int, not BigInt: SQLite only auto-increments INTEGER PRIMARY KEY, and 2^31
+  // rows is centuries of headroom at 5-minute polling.
+  id              Int           @id @default(autoincrement())
+  microinverterId Int
+  takenAt         DateTime
+  gridVoltage     Float
+  gridFrequency   Float
+  activePower     Float
+  reactivePower   Float
+  current         Float
+  powerFactor     Float
+  temperature     Float
+  powerLimitPct   Float?
+  warningNumber   Int?
+  linkStatus      Int?
+  rfSignal        Int?
+  microinverter   Microinverter @relation(fields: [microinverterId], references: [id])
+
+  @@index([microinverterId, takenAt])
+  @@index([takenAt])
+}
+
+/// DC-side reading per panel (PV port) per poll.
+model PortReading {
+  id          Int      @id @default(autoincrement())
+  pvPortId    Int
+  takenAt     DateTime
+  voltage     Float
+  current     Float
+  power       Float
+  energyDaily Int
+  energyTotal BigInt
+  errorCode   BigInt?
+  pvPort      PvPort   @relation(fields: [pvPortId], references: [id])
+
+  @@index([pvPortId, takenAt])
+  @@index([takenAt])
+}
+
+/// System-level rollup per poll. localDate = YYYY-MM-DD in the site timezone,
+/// computed at insert time; daily energy = max(dailyEnergy) grouped by it.
+model DtuReading {
+  id          Int      @id @default(autoincrement())
+  dtuId       Int
+  takenAt     DateTime
+  localDate   String
+  totalPower  Float
+  dailyEnergy Int
+  /// Lifetime accumulator where the gateway reports one (SunSpec WH). Null otherwise.
+  lifetimeEnergy Float?
+  /// Where the row came from: "dtu" for a reading this app polled, "cloud" for one
+  /// imported from a vendor export to fill a collection gap. Never blend the two
+  /// silently — an imported row is somebody else's measurement, and a chart that cannot
+  /// tell them apart is a chart that cannot be audited.
+  source      String   @default("dtu")
+  dtu         Dtu      @relation(fields: [dtuId], references: [id])
+
+  @@index([dtuId, takenAt])
+  @@index([takenAt])
+  @@index([localDate])
+}
+
+/// Configurable settings (electricity price, device hosts, thresholds).
+model Setting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+/// Health alerts raised by the collector's rule engine. Open = closedAt is null.
+model Alert {
+  id         Int       @id @default(autoincrement())
+  type       String
+  severity   String
+  subjectKey String
+  message    String
+  openedAt   DateTime  @default(now())
+  closedAt   DateTime?
+  ackedAt    DateTime?
+
+  @@index([closedAt])
+  @@index([subjectKey])
+}
+
+/// Tesla Wall Connector readings (local /api/1/vitals).
+model ChargerReading {
+  id               Int      @id @default(autoincrement())
+  takenAt          DateTime
+  vehicleConnected Boolean
+  charging         Boolean
+  power            Float
+  sessionEnergyWh  Float
+  gridVoltage      Float
+  handleTemp       Float?
+
+  @@index([takenAt])
+}
+
+/// A discovered/adopted home device (plug, light, thermostat, meter, battery…).
+/// `critical: true` devices are read-only — enforced in the service layer.
+model Device {
+  id         Int             @id @default(autoincrement())
+  vendor     String // kasa | mysa | shelly | …
+  kind       String // switch | light | thermostat | meter | battery | sensor
+  name       String
+  host       String
+  port       Int?
+  hardwareId String? // MAC / HAP id — stable across DHCP changes
+  room       String?
+  /// What this device measures, where that changes how its readings are used.
+  /// `mains` = clamped on the service entrance, so its signed power is the whole
+  /// property's exchange with the grid — which makes self-consumption measurable by
+  /// subtraction instead of guessed from a typed-in percentage. Null for everything
+  /// else: a plug measuring one appliance says nothing about the house.
+  /// At most one device may hold it; the API enforces that.
+  role       String?
+  critical   Boolean          @default(false)
+  enabled    Boolean          @default(true)
+  config     String? // vendor-specific JSON (e.g. HomeKit pairing keys)
+  createdAt  DateTime         @default(now())
+  readings   DeviceReading[]
+  schedules  DeviceSchedule[]
+
+  @@unique([vendor, hardwareId])
+}
+
+/// Time/sun-based automation for a device. Fires once per local day when its
+/// trigger time passes. Critical devices are never actuated (enforced in code).
+model DeviceSchedule {
+  id          Int      @id @default(autoincrement())
+  deviceId    Int
+  action      String // on | off | setTarget
+  trigger     String // sunrise | sunset | time
+  timeOfDay   String? // HH:MM when trigger = time
+  offsetMin   Int      @default(0) // relative to sunrise/sunset
+  value       Float? // setpoint for setTarget
+  enabled     Boolean  @default(true)
+  lastRunDate String? // YYYY-MM-DD guard
+  createdAt   DateTime @default(now())
+  device      Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId])
+}
+
+/// Generic device telemetry, stored on state changes and heartbeats.
+model DeviceReading {
+  id           Int      @id @default(autoincrement())
+  deviceId     Int
+  takenAt      DateTime
+  /// 0 = the device as a whole. Multi-channel meters (a 3EM's phases/legs, an
+  /// Emporia's circuits) also write one row per channel, numbered from 1.
+  channel      Int      @default(0)
+  on           Boolean?
+  /// Signed on meters: negative means exporting. Do not abs() it — the sign is the
+  /// difference between consuming and selling.
+  powerW       Float?
+  energyWh     Float?
+  /// Energy so far today, where the device reports a resetting daily figure (Daikin).
+  energyTodayWh Float?
+  /// Cumulative energy sent back to the grid, where the meter counts it separately.
+  energyReturnedWh Float?
+  temperatureC Float?
+  setpointC    Float?
+  /// Thermostat call-for-heat. Line-voltage heaters report no power, so duty cycle
+  /// x the element's rated watts is the only local energy estimate available.
+  heating      Boolean?
+  device       Device   @relation(fields: [deviceId], references: [id])
+
+  @@index([deviceId, channel, takenAt])
+}
+
+/// Home battery telemetry (e.g. EcoFlow). powerW > 0 = charging, < 0 = discharging.
+model BatteryReading {
+  id      Int      @id @default(autoincrement())
+  takenAt DateTime
+  soc     Float
+  powerW  Float
+  socLow  Float?
+
+  @@index([takenAt])
+}
+
+/// Local weather (Open-Meteo), stored alongside production for correlation.
+model WeatherReading {
+  id                 Int      @id @default(autoincrement())
+  takenAt            DateTime
+  temperature        Float
+  cloudCover         Int
+  windSpeed          Float?
+  shortwaveRadiation Float?
+  weatherCode        Int?
+
+  @@index([takenAt])
+}
+
+/// A banked-credit balance, read off a utility bill.
+///
+/// Entered rather than measured: the app sees production, not what the house imports or
+/// exports, so the bank balance is not derivable here. One row per bill.
+model CreditReading {
+  id         Int      @id @default(autoincrement())
+  /// The date the balance applies to — the bill's reading date, not when it was typed in.
+  readAt     DateTime
+  balanceKwh Float
+  note       String?
+  createdAt  DateTime @default(now())
+
+  @@index([readAt])
+}
+
+/// A day at the utility's own meter, imported from their usage export.
+///
+/// The same quantity a clamp on the service entrance measures, except the utility already
+/// measures it and bills on it — so where both exist, this wins. It is the number the
+/// money is actually calculated from.
+///
+/// `unmetered` marks a day the array produced while this recorded no export at all. That
+/// is not perfect self-consumption; it is a meter that was not counting what left the
+/// property, and averaging it in would credit the house with energy it gave away.
+model UtilityReading {
+  id          Int      @id @default(autoincrement())
+  /// YYYY-MM-DD, local.
+  date        String   @unique
+  importedKwh Float
+  exportedKwh Float
+  /// Where this came from — the filename or format, so a later import can explain itself.
+  source      String
+  /// True when production existed and export read zero. Excluded from self-consumption.
+  unmetered   Boolean  @default(false)
+  importedAt  DateTime @default(now())
+
+  @@index([date])
+}
+
+/// A published monthly average retail fuel price, cached.
+///
+/// Stored rather than fetched on demand for three reasons, in order of importance: a drive
+/// from last March must keep being priced at last March's figure however the feed changes;
+/// the comparison has to work on a Pi with no internet; and asking a government API once a
+/// day is politer than asking it every time somebody opens the Car page.
+///
+/// `source` is carried so a second source can be added later — a provincial regulator
+/// publishing weekly, or the owner typing in what they actually paid — without the two
+/// silently overwriting each other.
+model FuelPrice {
+  id            Int      @id @default(autoincrement())
+  /// YYYY-MM: the month the average describes, not the month it was published.
+  month         String
+  /// The source's own identifier for the place — a Statistics Canada geography member id.
+  geography     String
+  centsPerLitre Float
+  source        String   @default("statcan")
+  fetchedAt     DateTime @default(now())
+
+  @@unique([source, geography, month])
+  @@index([source, geography])
+}
+
+/// One month's learned system response — watts of AC output per W/m² of irradiance.
+///
+/// The quantity that decays as panels age, with weather divided out of it by construction.
+/// Its slope across years is this roof's own degradation rate, measured rather than read
+/// off a warranty.
+///
+/// Stored monthly because it cannot be reconstructed later: deriving it needs output
+/// paired with irradiance at the time, and nobody keeps that from before they thought to.
+/// Every month not recorded is permanently missing from a measurement that only becomes
+/// more valuable with age — which is why this table exists years before it can say
+/// anything.
+model SystemResponseSnapshot {
+  id                 Int      @id @default(autoincrement())
+  /// YYYY-MM, local. One row per month; the month in progress is rewritten as it fills.
+  month              String   @unique
+  wattsPerIrradiance Float
+  /// Paired output/irradiance samples behind the median. A month with too few is a
+  /// measurement of something other than the array, and is dropped when fitting.
+  samples            Int
+  /// Capacity at the time, so a later array extension is visible rather than reading as
+  /// a sudden improvement in the panels.
+  ratedKw            Float?
+  recordedAt         DateTime @default(now())
+}
+
+/// Every notification the app raised, whether or not a webhook carried it away.
+///
+/// Recorded before the delivery attempt, so the log is complete on an install that has
+/// configured no webhook at all — which is the default, and where this is the ONLY place
+/// the sunset daily summary can be read.
+model Notification {
+  id          Int       @id @default(autoincrement())
+  raisedAt    DateTime
+  title       String?
+  body        String
+  tags        String?
+  /// Null while undelivered. With a null `error` too, that means there was nowhere to send it.
+  deliveredAt DateTime?
+  error       String?
+
+  @@index([raisedAt])
+}
