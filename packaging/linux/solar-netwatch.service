@@ -1,0 +1,14 @@
+[Unit]
+Description=Solar Dashboard network watchdog
+# Deliberately NOT After=network-online.target. This is the thing that runs when the network
+# is not online; waiting for it would be waiting for the condition it exists to repair.
+
+[Service]
+Type=oneshot
+ExecStart=/opt/solar-dashboard/service/netwatch.sh
+# Root: it bounces interfaces, reloads kernel modules and can reboot the machine. None of
+# that is reachable from the network-facing app, which is the point of it being separate.
+User=root
+# A watchdog that can hang is not a watchdog. Well above the sleeps inside the script, well
+# below the timer interval, so a stuck run cannot overlap the next one.
+TimeoutStartSec=45

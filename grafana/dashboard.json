@@ -1,0 +1,44 @@
+{
+  "title": "Hoymiles Solar",
+  "uid": "hoymiles-solar",
+  "timezone": "browser",
+  "refresh": "1m",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "System power",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [{ "expr": "solar_dtu_power_watts" }],
+      "fieldConfig": { "defaults": { "unit": "watt" } }
+    },
+    {
+      "type": "stat",
+      "title": "Energy today",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 8 },
+      "targets": [{ "expr": "solar_dtu_daily_energy_wh" }],
+      "fieldConfig": { "defaults": { "unit": "watth" } }
+    },
+    {
+      "type": "stat",
+      "title": "Open alerts",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 8 },
+      "targets": [{ "expr": "solar_open_alerts" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-inverter power",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [{ "expr": "solar_inverter_power_watts", "legendFormat": "{{serial}}" }],
+      "fieldConfig": { "defaults": { "unit": "watt" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Inverter temperatures",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [{ "expr": "solar_inverter_temperature_celsius", "legendFormat": "{{serial}}" }],
+      "fieldConfig": { "defaults": { "unit": "celsius" } }
+    }
+  ],
+  "schemaVersion": 39,
+  "description": "Scrape target: http://<host>:8080/api/metrics"
+}
