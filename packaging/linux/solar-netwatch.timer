@@ -1,0 +1,14 @@
+[Unit]
+Description=Check the network every minute, and repair it if it has gone
+
+[Timer]
+# From boot rather than from a calendar: the first minutes after a restart are exactly when
+# a link fails to come up, and a calendar timer would sit idle through them.
+OnBootSec=2min
+OnUnitActiveSec=1min
+# No randomised delay. The thresholds in the script are counted in runs, so a jittered
+# interval would make "unreachable for three checks" mean an unpredictable amount of time.
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

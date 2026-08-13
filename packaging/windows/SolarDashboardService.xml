@@ -1,0 +1,30 @@
+<service>
+  <id>SolarDashboard</id>
+  <name>Solar Dashboard</name>
+  <description>Local solar, EV and home energy monitoring</description>
+  <executable>%BASE%\..\solar-dashboard.exe</executable>
+  <workingdirectory>%BASE%\..</workingdirectory>
+
+  <!--
+    Data lives in ProgramData, not next to the executable.
+
+    The installer puts the app in Program Files, which is read-only for normal users
+    by design. The service itself runs as LocalSystem and could write there, but
+    anyone launching solar-dashboard.exe by hand runs as themselves and would either
+    fail outright or have their database silently redirected into the VirtualStore,
+    where the service would never see it. One writable location avoids both.
+  -->
+  <env name="SOLAR_DATA_DIR" value="%ProgramData%\SolarDashboard\data"/>
+  <env name="PORT" value="3001"/>
+  <!-- 5 min keeps the DTU's S-Miles cloud uplink alive; 30 s starves it. -->
+  <env name="POLL_INTERVAL_MS" value="300000"/>
+
+  <startmode>Automatic</startmode>
+  <!-- Solar gateways and the network are not always up when the service is. -->
+  <onfailure action="restart" delay="10 sec"/>
+  <log mode="roll-by-size">
+    <logpath>%ProgramData%\SolarDashboard\logs</logpath>
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>4</keepFiles>
+  </log>
+</service>

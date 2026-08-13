@@ -1,0 +1,20 @@
+[Unit]
+Description=Solar Dashboard update check
+# Pointless without a network, and starting one second after the link comes up means a
+# check on every boot that would otherwise silently do nothing.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/solar-dashboard/service/update.sh
+# Runs as root: it replaces a binary in /opt and restarts a unit. This is precisely why it
+# is a separate oneshot rather than anything the network-facing app can reach.
+User=root
+# A failed update must not take the machine down with it. The unit exits non-zero on a
+# rollback, which is information for journalctl, not a reason to enter a failed state.
+SuccessExitStatus=0 1
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target
