@@ -10,16 +10,16 @@
     "prisma:migrate": "prisma migrate dev"
   },
   "dependencies": {
-    "@nestjs/common": "^11.1.28",
-    "@nestjs/core": "^11.1.28",
-    "@nestjs/platform-express": "^11.1.28",
+    "@nestjs/common": "^11.1.29",
+    "@nestjs/core": "^11.1.29",
+    "@nestjs/platform-express": "^11.1.29",
     "@nestjs/serve-static": "^5.0.5",
     "@prisma/client": "^6.19.3",
     "dotenv": "^17.4.2",
     "hap-controller": "^0.10.2",
     "mqtt": "^5.15.2",
-    "pg": "^8.22.0",
-    "protobufjs": "^8.7.1",
+    "pg": "^8.23.0",
+    "protobufjs": "^8.7.2",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",
     "ws": "^8"
@@ -27,11 +27,11 @@
   "devDependencies": {
     "@nestjs/cli": "^11.0.24",
     "@types/express": "^5.0.6",
-    "@types/node": "^26.1.1",
-    "@types/pg": "^8.20.0",
+    "@types/node": "^26.2.0",
+    "@types/pg": "^8.21.0",
     "@types/ws": "^8.18.1",
-    "@yao-pkg/pkg": "^6.21.0",
-    "esbuild": "^0.28.1",
+    "@yao-pkg/pkg": "^6.22.0",
+    "esbuild": "^0.28.2",
     "prisma": "^6.19.3",
     "typescript": "^6.0.3",
     "vitest": "^4.1.10"
