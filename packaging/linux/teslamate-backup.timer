@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily TeslaMate database backup
+
+[Timer]
+# 03:15, a quarter hour after the dashboard's own 03:00 default. Two dumps of two
+# databases onto one USB drive at the same instant is a self-inflicted I/O collision, and
+# staggering them costs nothing.
+OnCalendar=*-*-* 03:15:00
+# A Pi that was off overnight still gets a backup when it comes back, rather than skipping
+# a day silently.
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target
