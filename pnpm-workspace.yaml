@@ -1,0 +1,17 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# Native modules pulled in transitively that this project never loads — USB, serial,
+# Bluetooth and HID bindings behind optional device support. Building them needs a
+# toolchain that a clone should not have to have, and the failure when it is missing
+# looks like a broken install rather than an optional dependency doing nothing.
+#
+# Lives here rather than under a "pnpm" key in package.json: pnpm 10 stopped reading
+# that key and printed a warning on every single command instead of honouring it.
+neverBuiltDependencies:
+  - usb
+  - "@serialport/bindings-cpp"
+  - "@stoprocent/noble"
+  - "@stoprocent/bluetooth-hci-socket"
+  - node-hid

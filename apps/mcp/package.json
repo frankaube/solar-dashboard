@@ -1,0 +1,15 @@
+{
+  "name": "@hoymiles/mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ask an AI assistant questions about your solar system. Read-only MCP server over the dashboard's REST API.",
+  "type": "module",
+  "main": "src/server.mjs",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.10"
+  }
+}

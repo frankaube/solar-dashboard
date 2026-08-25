@@ -1,0 +1,272 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (must already exist)'
+        required: true
+
+# Every release this produces is a DRAFT, and that is load-bearing rather than cautious.
+#
+# A draft is invisible to the unauthenticated call the updater makes, so a release with no
+# signature on it yet cannot be picked up by any machine. Signing happens on the maintainer's
+# own computer, with a key this workflow has no access to; publishing the draft afterwards is
+# the deliberate act that makes it installable.
+#
+# Three independent things would each have to fail before an unsigned build could install:
+# the draft would have to be published, GitHub would have to serve drafts anonymously, and
+# the updater would have to stop requiring SHA256SUMS.minisig.
+
+permissions:
+  contents: write
+  # For build provenance — see the attest step.
+  id-token: write
+  attestations: write
+
+jobs:
+  # The installer has to be compiled on Windows — Inno Setup is a Windows program and the
+  # payload it wraps is the win-x64 build. It runs first and hands the .exe to the Linux
+  # job as an artifact, so that job can fold it into the one SHA256SUMS the maintainer
+  # signs. Appending to the checksums afterwards would mean signing a file that changed
+  # after it was written.
+  installer:
+    name: Windows installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir apps/api exec prisma generate
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Fetch the WinSW service wrapper
+        # `packaging/vendor/` is gitignored, so this never existed anywhere but the
+        # maintainer's disk — which is why the installer built locally and the first CI run
+        # failed on a file that was, in every meaningful sense, not vendored at all.
+        #
+        # Pinned by version AND by hash. The hash is not upstream's published one; it is the
+        # digest of the exact binary the installer was built and tested against locally, so
+        # CI either gets those bytes or gets nothing. A release that silently picked up a
+        # different service wrapper would be a supply-chain change nobody reviewed.
+        shell: bash
+        env:
+          WINSW_VERSION: v2.12.0
+          WINSW_SHA256: 05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da
+        run: |
+          mkdir -p packaging/vendor
+          url="https://github.com/winsw/winsw/releases/download/${WINSW_VERSION}/WinSW-x64.exe"
+          echo "downloading $url"
+          curl -fsSL --retry 3 -o packaging/vendor/WinSW-x64.exe "$url"
+          actual="$(sha256sum packaging/vendor/WinSW-x64.exe | cut -d' ' -f1)"
+          if [ "$actual" != "$WINSW_SHA256" ]; then
+            echo "::error::WinSW checksum mismatch — expected $WINSW_SHA256, got $actual"
+            exit 1
+          fi
+          echo "WinSW ${WINSW_VERSION} verified ($actual)"
+
+      - name: Build the installer
+        # Builds the win-x64 payload, stages WinSW, compiles the .iss. Its version comes
+        # from package.json, which the build job checks against the tag.
+        run: node packaging/build-installer.mjs
+
+      - name: It must exist, and carry the version being released
+        shell: bash
+        run: |
+          exe=packaging/out/SolarDashboardSetup.exe
+          [ -f "$exe" ] || { echo "::error::$exe missing"; exit 1; }
+          stamp=packaging/out/win/version.json
+          [ -f "$stamp" ] || { echo "::error::$stamp missing"; exit 1; }
+          version="$(node -p "require('./package.json').version")"
+          node -e "
+            const s = require('./$stamp');
+            if (s.version !== '$version') {
+              console.error('payload is ' + s.version + ', releasing $version');
+              process.exit(1);
+            }
+            console.log('installer payload', s.version, s.commit);
+          "
+          ls -la "$exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: packaging/out/SolarDashboardSetup.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    name: Build and draft
+    needs: installer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          # The stamp records the commit, so the checkout has to be a real one.
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        # No version here on purpose. It comes from "packageManager" in package.json, which
+        # is what corepack reads locally — one source, so CI cannot silently run a different
+        # pnpm from the one a contributor has. Specifying both is a hard error in v4.
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Tag must match the version in package.json
+        # The updater compares versions to decide whether to replace a running binary. A
+        # release tagged v0.2.0 containing a build stamped 0.1.9 would install and then
+        # immediately offer itself again, forever.
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          version="v$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag $tag does not match package.json ($version)"
+            exit 1
+          fi
+          echo "building $version"
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir apps/api exec prisma generate
+
+      # Tests before artifacts. A release that was never green is worse than a late one.
+      - run: pnpm --filter api test
+      - run: pnpm --filter web test
+      # The MCP server is not in the packaged binary, but it ships in the tree a release
+      # is cut from, and a release that was never green is worse than a late one.
+      - run: pnpm --filter mcp test
+
+      - name: Build every target
+        run: node packaging/build.mjs all
+
+      - name: Stamp check
+        # buildInfo() falls back to an honest "dev" when the stamp is missing, and the
+        # updater refuses to replace a build it cannot identify — so an unstamped release
+        # would install once and then never update again.
+        run: |
+          for target in arm64 linux win; do
+            file="packaging/out/$target/version.json"
+            [ -f "$file" ] || { echo "::error::$file missing"; exit 1; }
+            node -e "
+              const s = require('./$file');
+              if (!s.version || !s.commit) { console.error('unstamped: $file'); process.exit(1); }
+              console.log('$target'.padEnd(6), s.version, s.commit);
+            "
+          done
+
+      - uses: actions/download-artifact@v4
+        # After the build (which clears packaging/out/<target>) and before packaging, so
+        # release.mjs sees the .exe and puts it in SHA256SUMS.
+        with:
+          name: windows-installer
+          path: packaging/out
+
+      - name: Package
+        run: node packaging/release.mjs all
+
+      - name: The installer must be in the checksums
+        # Cheap, and it catches the one failure that matters: an installer attached to the
+        # release but absent from the file the signature covers — unverifiable, and looking
+        # perfectly normal on the release page.
+        run: |
+          grep -q 'SolarDashboardSetup.exe' packaging/out/SHA256SUMS || {
+            echo "::error::SolarDashboardSetup.exe is missing from SHA256SUMS"
+            exit 1
+          }
+
+      - name: Install the artifact before offering it to anyone
+        # The last thing between a broken release and a fleet of Pis. It signs the real
+        # SHA256SUMS with a throwaway key, runs the real updater against the real tarball,
+        # and checks the install, a tampered copy and a rollback.
+        #
+        # This catches what the unit tests structurally cannot: an archive rooted at the
+        # wrong directory, a missing Prisma engine, a binary that arrives without its
+        # executable bit, a stamp that disagrees with the bundle it is inside.
+        run: bash scripts/test-release-artifact.sh
+
+      - name: Provenance
+        # A Sigstore-backed statement that these exact bytes came out of this workflow, at
+        # this commit. It does not replace the minisign signature — that is a human saying
+        # "I meant to release this" — but it does let anyone check that the artifacts are
+        # what CI produced rather than something uploaded afterwards:
+        #
+        #   gh attestation verify solar-dashboard-arm64.tar.gz -R frankaube/solar-dashboard
+        #
+        # Worth having precisely because the build is not bit-for-bit reproducible, so
+        # rebuilding locally cannot prove the same thing.
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'packaging/out/*.tar.gz'
+
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          {
+            echo "## Not installable yet"
+            echo ""
+            echo "This draft has no \`SHA256SUMS.minisig\`. Until one is attached and the"
+            echo "release is published, no installation will accept it — the updater requires"
+            echo "a signature verified against a configured key, and refuses anything without"
+            echo "one. That refusal is the point, not a bug to work around."
+            echo ""
+            echo "To finish, on the machine holding the signing key:"
+            echo ""
+            echo '```bash'
+            echo "scripts/sign-release.sh $TAG"
+            echo '```'
+            echo ""
+            echo "That signs, verifies, uploads the signature, replaces these notes with the"
+            echo "changelog for this version, and publishes — in that order, so the release"
+            echo "cannot become visible before it is installable. Doing the four steps by"
+            echo "hand works too, but publishing before signing produces exactly this page,"
+            echo "live, saying it cannot be installed. Which is true, and confusing."
+            echo ""
+            echo "## Checksums"
+            echo ""
+            echo '```'
+            cat packaging/out/SHA256SUMS
+            echo '```'
+            echo ""
+            echo "Built from \`${{ github.sha }}\`."
+          } > notes.md
+
+          gh release create "$TAG" \
+            --draft \
+            --title "$TAG" \
+            --notes-file notes.md \
+            packaging/out/*.tar.gz \
+            packaging/out/SolarDashboardSetup.exe \
+            packaging/out/SHA256SUMS
+
+      - name: Say what happens next
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          {
+            echo "### Draft release $TAG created"
+            echo ""
+            echo "It is **not** installable. Sign \`SHA256SUMS\` locally, upload the"
+            echo "\`.minisig\`, then publish the draft."
+            echo ""
+            echo '```'
+            cat packaging/out/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
