@@ -1,0 +1,649 @@
+import { ReactElement } from 'react';
+import { Link as RouterLink } from 'react-router-dom';
+import Box from '@mui/material/Box';
+import Link from '@mui/material/Link';
+import Tooltip from '@mui/material/Tooltip';
+import Typography from '@mui/material/Typography';
+import {
+  Alerts,
+  DailyEnergy,
+  EnergyStats,
+  PanelMeta,
+  PowerPoint,
+  ProductionAnalytics,
+  Snapshot,
+  Summary,
+  Weather,
+  fetchBattery,
+  fetchCharger,
+  fetchEnergyHistory,
+  fetchProductionAnalytics,
+  fetchStats,
+  fetchWeather,
+  usePolling,
+} from '../api';
+import { Chart } from '../charts/Chart';
+import { basePreset, powerSeries } from '../charts/preset';
+import { EnergyFlow } from '../components/EnergyFlow';
+import { FlowStrip } from '../components/FlowStrip';
+import { Metric, Surface } from '../components/Surface';
+import { WeatherCard } from '../components/WeatherCard';
+import { madeTodayHint } from './energyHint';
+import { standingLine, weighAlerts } from './alertWeight';
+import { useLiveMoney, usePrefersReducedMotion } from '../shell/motion';
+import { solar } from '../theme';
+
+const SLOW_POLL_MS = 5 * 60_000;
+const NIGHT_W = 10;
+
+/** Status pill: hue + icon + word — three channels, so greyscale/CVD still read. */
+function StatusPill({ tone, children }: { tone: 'ok' | 'warn' | 'unknown'; children: string }): ReactElement {
+  const skin =
+    tone === 'ok'
+      ? { bg: solar.pill.ok.bg, border: solar.pill.ok.border, fg: solar.series.money }
+      : tone === 'warn'
+        ? { bg: solar.pill.warn.bg, border: solar.pill.warn.border, fg: solar.status.warn }
+        : { bg: solar.surface.raised, border: solar.pill.neutral.border, fg: solar.status.info };
+  return (
+    <Box
+      component="span"
+      sx={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: '7px',
+        px: '13px',
+        py: '7px',
+        borderRadius: '999px',
+        bgcolor: skin.bg,
+        border: `1px solid ${skin.border}`,
+        color: skin.fg,
+        font: `600 12px/1 ${solar.font.sans}`,
+        flex: '0 0 auto',
+      }}
+    >
+      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth={1.8}>
+        {tone === 'ok' ? (
+          <path d="M2.5 6.4l2.4 2.4L9.8 3.6" />
+        ) : tone === 'warn' ? (
+          <>
+            <path d="M6 1.8l4.6 8.4H1.4z" />
+            <path d="M6 5.2v2.1M6 9h.01" />
+          </>
+        ) : (
+          <>
+            <circle cx="6" cy="6" r="4.4" />
+            <path d="M6 8.4V5.6M6 3.7h.01" />
+          </>
+        )}
+      </svg>
+      {children}
+    </Box>
+  );
+}
+
+/** One labelled figure in the hero band: overline, number, reference line. */
+function Stat({
+  label,
+  caption,
+  hint,
+  children,
+}: {
+  label: string;
+  caption: string;
+  /** Shown on hover and focus. Omitted entirely when there is nothing true to say. */
+  hint?: string;
+  children: ReactElement;
+}): ReactElement {
+  // The figure carries the tooltip, not the whole tile: a column-sized hover target fires
+  // when the pointer is merely passing through. `tabIndex` so a keyboard can reach it too.
+  const figure = hint ? (
+    <Tooltip title={hint} enterTouchDelay={0}>
+      <Box component="span" tabIndex={0} sx={{ display: 'inline-flex', width: 'fit-content', cursor: 'help' }}>
+        {children}
+      </Box>
+    </Tooltip>
+  ) : (
+    children
+  );
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+      <Typography variant="overline" color="text.disabled">
+        {label}
+      </Typography>
+      {figure}
+      <Typography variant="caption" color="text.disabled">
+        {caption}
+      </Typography>
+    </Box>
+  );
+}
+
+/**
+ * Dollars, with cents while cents are what there is.
+ *
+ * Under ten dollars the cents are the number — rounding makes two tiles showing the same
+ * money disagree.
+ */
+function money(amount: number): string {
+  const decimals = amount < 10 ? 2 : 0;
+  return `$${amount.toLocaleString('en-CA', {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  })}`;
+}
+
+/** Join a list in prose: [a] → "a", [a,b] → "a and b", [a,b,c] → "a, b and c". */
+function proseList(parts: string[]): string {
+  if (parts.length <= 1) return parts[0] ?? '';
+  return `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+}
+
+/** Compact "where the roof's power is going right now" — the quick read above the full flow. */
+function WhereItsGoing({ solarW, evW, batteryW }: { solarW: number; evW: number; batteryW: number }): ReactElement {
+  const rest = Math.max(0, solarW - evW - Math.max(0, batteryW));
+  const rows = [
+    // Labelled for what it is. Without a whole-home CT this is house AND export, and a row
+    // called "The house" makes a claim the app cannot measure — the sankey already says this.
+    rest > 0 ? { label: 'House + grid', v: rest, color: solar.series.house } : null,
+    evW > 0 ? { label: 'The car', v: evW, color: solar.series.car } : null,
+    batteryW > 0 ? { label: 'Battery', v: batteryW, color: solar.series.battery } : null,
+    batteryW < 0 ? { label: 'From battery', v: -batteryW, color: solar.series.battery } : null,
+  ].filter(Boolean) as Array<{ label: string; v: number; color: string }>;
+  const max = Math.max(solarW, ...rows.map((r) => r.v), 1);
+  const parts = [
+    rest > 0 ? 'the house' : null,
+    evW > 0 ? 'the car' : null,
+    batteryW > 0 ? 'charging the battery' : null,
+  ].filter(Boolean) as string[];
+  const sentence =
+    solarW < 20
+      ? batteryW < 0
+        ? 'The battery is covering the house — the roof is resting.'
+        : 'The roof is resting for now.'
+      : parts.length
+        ? `Your roof is powering ${proseList(parts)}.`
+        : 'Your roof is producing.';
+  return (
+    <Surface
+      title={
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', width: '100%' }}>
+          <Typography variant="subtitle1">Where it&rsquo;s going</Typography>
+          <Typography variant="caption" color="text.disabled">right now</Typography>
+        </Box>
+      }
+    >
+      <Typography variant="answer" sx={{ fontSize: 15, lineHeight: 1.5, color: solar.ink.sec, display: 'block', mb: 3 }}>
+        {sentence}
+      </Typography>
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: '11px' }}>
+        {rows.map((r) => (
+          <Box key={r.label} sx={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+            <Box sx={{ width: 9, height: 9, borderRadius: '3px', flex: '0 0 9px', bgcolor: r.color }} />
+            <Typography sx={{ width: 96, flex: '0 0 96px', font: `500 13px/1.3 ${solar.font.sans}`, color: solar.ink.pri }}>
+              {r.label}
+            </Typography>
+            <Box sx={{ flex: 1, height: 10, borderRadius: '3px', bgcolor: solar.surface.inset, overflow: 'hidden' }}>
+              <Box sx={{ width: `${(r.v / max) * 100}%`, height: 10, borderRadius: '3px', bgcolor: r.color }} />
+            </Box>
+            <Typography variant="mono" sx={{ width: 58, textAlign: 'right', color: solar.ink.sec }}>
+              {(r.v / 1000).toFixed(1)} kW
+            </Typography>
+          </Box>
+        ))}
+      </Box>
+      {/* The row label carries the caveat; this only has to say why it cannot be split. */}
+      {rest > 0 && (
+        <Typography variant="caption" color="text.disabled" sx={{ display: 'block', mt: 4, lineHeight: 1.5 }}>
+          Splitting these needs a whole-home meter.
+        </Typography>
+      )}
+    </Surface>
+  );
+}
+
+interface OverviewPageProps {
+  summary: Summary | null;
+  history: PowerPoint[] | null;
+  alerts: Alerts | null;
+}
+
+export function OverviewPage({ summary, history, alerts }: OverviewPageProps): ReactElement {
+  const { data: stats } = usePolling<EnergyStats>(fetchStats, SLOW_POLL_MS);
+  const { data: analytics } = usePolling<ProductionAnalytics>(
+    () => fetchProductionAnalytics(24),
+    SLOW_POLL_MS,
+  );
+  const { data: weather } = usePolling<Weather>(fetchWeather, SLOW_POLL_MS);
+  const { data: energy } = usePolling<DailyEnergy[]>(() => fetchEnergyHistory(30), SLOW_POLL_MS);
+  const { data: charger } = usePolling(fetchCharger, 60_000);
+  const { data: battery } = usePolling(fetchBattery, 60_000);
+
+  const nowW = summary?.currentPowerW ?? 0;
+  const night = nowW < NIGHT_W;
+  // Rated size comes from the API (owner-configured, else estimated), never a constant.
+  const ratedKw = summary?.ratedKw && summary.ratedKw > 0 ? summary.ratedKw : null;
+  const capPct = ratedKw ? Math.min(100, (nowW / 1000 / ratedKw) * 100) : 0;
+  const active = alerts?.active ?? [];
+  const yesterdayWh = energy && energy.length > 1 ? energy[energy.length - 2].energyWh : null;
+  // Energy and its value must describe the SAME day: after midnight "today" is near zero
+  // and yesterday's total is the useful number, so both tiles have to move together.
+  const showYesterday = night && yesterdayWh !== null && (summary?.todayEnergyWh ?? 0) < yesterdayWh;
+  const shownDayLabel = showYesterday ? 'yesterday' : 'today';
+  const shownEnergyWh = showYesterday ? (yesterdayWh ?? 0) : (summary?.todayEnergyWh ?? 0);
+  const shownWorth = showYesterday
+    ? ((yesterdayWh ?? 0) / 1000) * (summary?.pricePerKwh ?? 0)
+    : (summary?.todayRevenue ?? 0);
+  /*
+    Which day the money figure describes, taken from the daily series rather than a clock, so
+    it uses the same bucketing as the totals. The ticking counter needs it: its no-decrease
+    floor is right within a day and wrong across two, and this tile crosses twice a day.
+  */
+  const worthDayKey = showYesterday
+    ? (energy?.[energy.length - 2]?.date ?? 'yesterday')
+    : (energy?.[energy.length - 1]?.date ?? 'today');
+  /*
+    The money figure ticks while the roof is working, and only for today — a closed day has
+    nothing to project. Power comes from the same snapshot as the revenue it projects, so
+    the two cannot describe different moments; zero power stops it dead.
+  */
+  const reducedMotion = usePrefersReducedMotion();
+  const liveWorth = useLiveMoney({
+    settled: shownWorth,
+    powerW: showYesterday ? 0 : (summary?.currentPowerW ?? 0),
+    pricePerKwh: summary?.pricePerKwh ?? 0,
+    enabled: !reducedMotion,
+    dayKey: worthDayKey,
+  });
+  // Tomorrow's expected output, and when to plug in for it. From measured irradiance and
+  // this array's learned response, not from the WMO precipitation code.
+  const tomorrowDate = (() => {
+    const d = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const pad = (n: number): string => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  })();
+  const tomorrow = analytics?.outlook?.find((day) => day.date === tomorrowDate) ?? null;
+  const window = analytics?.chargeWindow ?? null;
+  const hourOf = (iso: string): string => iso.slice(11, 16);
+  const chargeWindowText = window
+    ? `best ${hourOf(window.start)}–${hourOf(window.end)}, about ${window.avgKw} kW`
+    : null;
+
+  /*
+    What today's total is worth comparing against. Yesterday first, but only while the day
+    is still running — after midnight the tile itself shows yesterday. The best day is the
+    fallback, and needs enough history behind it to mean anything.
+  */
+  const kwh = (wh: number): string => (wh / 1000).toFixed(wh < 10_000 ? 1 : 0);
+  const bestDayWh = stats?.records.bestDayWh ?? 0;
+  const enoughHistory = (stats?.records.daysCollecting ?? 0) >= 3;
+  const energyCaption =
+    [
+      !showYesterday && yesterdayWh !== null ? `${kwh(yesterdayWh)} yesterday` : null,
+      enoughHistory && bestDayWh > 0 ? `best ${kwh(bestDayWh)}` : null,
+    ]
+      .filter(Boolean)
+      .join(' · ') || ' ';
+
+  // On hover: the same clock time yesterday, which is the comparison the caption cannot make.
+  const energyHint = madeTodayHint(
+    shownEnergyWh,
+    stats?.yesterdayAtThisTimeWh ?? null,
+    showYesterday,
+  );
+
+  const evNowW = charger?.live?.charging ? charger.live.powerW : 0;
+  const batteryNowW = battery?.present ? (battery.powerW ?? 0) : 0;
+
+  // Actual vs clear-day estimate. Only pairs where BOTH sides exist may be compared —
+  // counting actual against a missing expected inflates the ratio into a false all-clear.
+  const paired = (analytics?.points ?? []).filter((p) => p.expectedW !== null && p.expectedW > 0);
+  const todayPct = paired.length
+    ? (() => {
+        const a = paired.reduce((s, p) => s + p.actualW, 0);
+        const e = paired.reduce((s, p) => s + (p.expectedW ?? 0), 0);
+        return e > 0 ? Math.round((a / e) * 100) : null;
+      })()
+    : null;
+  const powerSubtitle =
+    todayPct == null
+      ? 'actual vs a clear-day estimate'
+      : todayPct >= 98
+        ? 'Running at or above a clear-day pace.'
+        : `About ${100 - todayPct}% under a clear day${todayPct < 85 ? ' — cloudy.' : ' — some cloud.'}`;
+
+  const series = powerSeries(
+    (analytics?.points ?? history ?? []).map((p) => [
+      p.t,
+      'actualW' in p ? (p as { actualW: number }).actualW : (p as PowerPoint).powerW,
+    ]),
+    (analytics?.points ?? []).map((p) => [p.t, p.expectedW]),
+    (analytics?.points ?? []).map((p) => [p.t, p.yesterdayW]),
+  );
+  // Daylight band: shade sunrise→sunset behind the curve.
+  //
+  // Attached by name, not index: the series list is not a fixed length — a yesterday line
+  // appears in front of these two when there is one to draw.
+  const sunrise = weather?.daily?.sunrise?.[0];
+  const sunset = weather?.daily?.sunset?.[0];
+  const actualSeries = series.find((s) => (s as { name?: string }).name === 'Actual');
+  if (sunrise && sunset && actualSeries) {
+    (actualSeries as { markArea?: unknown }).markArea = {
+      silent: true,
+      itemStyle: { color: 'rgba(240,180,41,0.05)' },
+      data: [[{ xAxis: sunrise }, { xAxis: sunset }]],
+    };
+  }
+  const chartOption = {
+    ...basePreset(),
+    yAxis: {
+      ...(basePreset().yAxis as object),
+      axisLabel: {
+        color: solar.ink.dim,
+        fontFamily: 'ui-monospace,Menlo,monospace',
+        fontSize: 10,
+        formatter: (v: number) => `${v / 1000}`,
+      },
+    },
+    series,
+  };
+
+  // One plain-language answer for the hero — folds in status and the sky.
+  const cur = weather?.current ?? null;
+  const skyPhrase = !cur
+    ? ''
+    : cur.cloudCover <= 25
+      ? 'a bright day'
+      : cur.cloudCover <= 60
+        ? 'some cloud around'
+        : 'overcast, running light';
+  // `alerts === null` means "haven't heard back" (usePolling keeps the last good value and
+  // swallows errors), which is not the same as "nothing is wrong" — don't claim all-clear.
+  const alertsKnown = alerts !== null;
+  // Only a fault that is costing production right now may take this line; any open alert
+  // would let a days-old charger fault own the widest strip on the page. See alertWeight.ts.
+  const { headline, standing } = weighAlerts(active);
+
+  const answer = !alertsKnown
+    ? 'Checking on your system…'
+    : headline
+      ? headline.message
+      : night
+        ? 'Asleep for the night — back at sunrise.'
+        : skyPhrase
+          ? `Everything’s running normally — ${skyPhrase}.`
+          : 'Everything’s running normally.';
+
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+      {/*
+        HERO BAND — the answer, then the live number, then the day's figures beside it.
+
+        This was a card two-thirds as wide with a divider and nothing after it: the number
+        claimed a column it did not fill, and the four figures that belong with it were
+        pushed into their own row. One band across the page puts them where the blank was.
+      */}
+      <Surface hero sx={{ p: 7, borderRadius: `${solar.radius.hero}px` }}>
+        <Box sx={{ position: 'relative', display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 3, flexWrap: 'wrap' }}>
+            {/*
+              "All good" would be a small lie with something standing open, and "Needs a look"
+              was a lie in the other direction while the roof made 8 kW. The pill says what is
+              actually true of production, and the standing line below says the rest.
+            */}
+            <StatusPill tone={!alertsKnown ? 'unknown' : headline ? 'warn' : 'ok'}>
+              {!alertsKnown
+                ? 'Checking'
+                : headline
+                  ? 'Needs a look'
+                  : standing.length
+                    ? night
+                      ? 'Asleep'
+                      : 'Producing'
+                    : 'All good'}
+            </StatusPill>
+            <Typography variant="answer" component="h2" sx={{ color: 'text.primary' }}>
+              {answer}
+            </Typography>
+          </Box>
+          <Box
+            sx={{
+              display: 'grid',
+              gridTemplateColumns: { xs: '1fr', md: 'minmax(260px, 320px) 1px 1fr' },
+              gap: { xs: 6, md: 9 },
+              alignItems: 'center',
+            }}
+          >
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <Typography variant="overline" color="text.disabled">
+                {night ? 'Asleep' : 'Making right now'}
+              </Typography>
+              <Metric value={(nowW / 1000).toFixed(1)} unit="kW" variant="metricHero" dim={night} />
+              {!night && ratedKw && (
+                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, mt: 1 }}>
+                  <Box sx={{ height: 5, borderRadius: '3px', bgcolor: solar.surface.border, overflow: 'hidden', maxWidth: 220 }}>
+                    <Box sx={{ width: `${capPct}%`, height: 5, borderRadius: '3px', bgcolor: solar.series.production, transition: 'width .4s' }} />
+                  </Box>
+                  <Typography variant="mono" sx={{ color: 'text.disabled' }}>
+                    {capPct.toFixed(0)}% of your {ratedKw.toFixed(0)} kW roof
+                    {stats ? ` · best ${(stats.records.peakPowerW / 1000).toFixed(1)} kW` : ''}
+                  </Typography>
+                </Box>
+              )}
+            </Box>
+            <Box sx={{ bgcolor: solar.surface.border, alignSelf: 'stretch', display: { xs: 'none', md: 'block' } }} />
+            {/*
+              auto-fit rather than a fixed four columns: "Tomorrow" only appears once the
+              array has taught the forecast what it does with irradiance, and a fixed grid
+              would leave its cell as a hole until then.
+            */}
+            <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 6 }}>
+              {/*
+                A reference under each number, because a total alone answers nothing — 8 kWh
+                is either a washout or a winter triumph depending on what this roof normally
+                does. The peak-power record used to caption this one: a watt figure under a
+                kWh figure. It has moved up to the kW number where its units match.
+              */}
+              <Stat label={`Made ${shownDayLabel}`} caption={energyCaption} hint={energyHint}>
+                <Metric value={(shownEnergyWh / 1000).toFixed(0)} unit="kWh" variant="metricLg" />
+              </Stat>
+              <Stat
+                label={`Worth ${shownDayLabel}`}
+                caption={`at ${((summary?.pricePerKwh ?? 0) * 100).toFixed(1)}¢/kWh`}
+              >
+                {/*
+                  Tabular figures are not decoration here. Proportional digits change width
+                  as they turn over, so a ticking counter would shuffle its own layout and
+                  nudge the tiles beside it several times a second.
+                */}
+                <Typography
+                  variant="metricLg"
+                  sx={{ color: solar.series.money, fontVariantNumeric: 'tabular-nums lining-nums' }}
+                >
+                  {liveWorth}
+                </Typography>
+              </Stat>
+
+              {/*
+                Tomorrow answers the one planning question this screen could never answer —
+                run the dryer today or tomorrow — from forecast irradiance times this array's
+                own learned response, not from a nameplate.
+              */}
+              {tomorrow !== null && (
+                <Stat label="Tomorrow" caption={chargeWindowText ?? 'expected'}>
+                  <Typography variant="metricLg" sx={{ color: solar.ink.sec }}>
+                    ~{Math.round(tomorrow.expectedWh / 1000)}
+                    <Typography component="span" variant="caption" sx={{ ml: 1 }}>
+                      kWh
+                    </Typography>
+                  </Typography>
+                </Stat>
+              )}
+
+              {/*
+                This month rides up here with the other running totals. What is left of the
+                payback card — a figure that moves once a day — became the strip at the foot
+                of the page rather than a tall card that was two-thirds air.
+              */}
+              <Stat
+                label="This month"
+                caption={`${((stats?.lifetimeWh ?? 0) / 1_000_000).toFixed(1)} MWh lifetime`}
+              >
+                <Typography variant="metricLg" sx={{ color: solar.series.money }}>
+                  {money(stats?.savings.month ?? 0)}
+                </Typography>
+              </Stat>
+            </Box>
+          </Box>
+          {/*
+            THE STANDING LINE — everything open that is not costing production.
+
+            Always here when something is open, in the same place, in a voice quiet enough to
+            skip. That is the point: a permanent condition should read as a status line, not
+            as an alarm that has been going off for three days. It names the faults rather
+            than counting them, so you can tell without clicking whether it is worth clicking,
+            and nothing above it moves when one opens or clears.
+          */}
+          {standing.length > 0 && (
+            <Box
+              sx={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 3,
+                mt: 6,
+                pt: 4,
+                borderTop: `1px solid ${solar.surface.border}`,
+              }}
+            >
+              <Box
+                aria-hidden
+                sx={{
+                  width: 6,
+                  height: 6,
+                  borderRadius: '50%',
+                  bgcolor: solar.status.warn,
+                  flex: 'none',
+                }}
+              />
+              <Typography
+                variant="mono"
+                noWrap
+                sx={{ color: 'text.disabled', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}
+              >
+                Standing: {standingLine(standing)}
+              </Typography>
+              <Box sx={{ flex: 1 }} />
+              <Link
+                component={RouterLink}
+                to="/system/health"
+                variant="mono"
+                sx={{ color: solar.status.warn, whiteSpace: 'nowrap' }}
+              >
+                See under System →
+              </Link>
+            </Box>
+          )}
+          {/*
+            Energy leaving the roof, along the bottom edge of the card.
+
+            Outside the padded content and flush to the card's corners, because a strip that
+            stopped short of the edge would read as another row of the layout rather than as
+            the card's own base. Absent at night — a still strip at zero says less than no
+            strip at all, and the figure above already says "Asleep".
+          */}
+          {!night && <FlowStrip pct={capPct} />}
+        </Box>
+      </Surface>
+
+      {/* Power today + where it's going */}
+      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', lg: '1fr 380px' }, gap: 5 }}>
+        <Surface
+          sx={{ display: 'flex', flexDirection: 'column' }}
+          title={
+            <Box>
+              <Typography variant="subtitle1">Power · last 24 hours</Typography>
+              <Typography variant="caption" color="text.disabled">{powerSubtitle}</Typography>
+            </Box>
+          }
+          action={
+            <Box sx={{ display: 'flex', gap: 4, font: `400 11px/1 ${solar.font.mono}`, color: solar.ink.sec }}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <Box sx={{ width: 14, height: '2px', bgcolor: solar.series.production }} /> what you made
+              </Box>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <Box sx={{ width: 14, borderTop: `2px dashed ${solar.series.expected}` }} /> a clear day
+              </Box>
+            </Box>
+          }
+        >
+          <Chart option={chartOption} height={230} fill />
+        </Surface>
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+          <WhereItsGoing solarW={nowW} evW={evNowW} batteryW={batteryNowW} />
+          <WeatherCard weather={weather ?? null} />
+        </Box>
+      </Box>
+
+      {/*
+        Payback as a strip, not a card.
+
+        It moves once a day and has three parts — a figure, a bar, a link — so a full card
+        left two-thirds of its height empty. Laid out along one line it says the same thing
+        in a fifth of the space.
+      */}
+      <Surface sx={{ py: 4, px: 6 }}>
+        <Box
+          sx={{
+            display: 'grid',
+            gridTemplateColumns: { xs: '1fr', md: 'auto 1fr auto' },
+            gap: { xs: 3, md: 7 },
+            alignItems: 'center',
+          }}
+        >
+          <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 3, flexWrap: 'wrap' }}>
+            <Typography variant="overline" color="text.disabled">
+              Paying itself off
+            </Typography>
+            <Typography variant="metricMd" sx={{ color: solar.series.money }}>
+              {money(stats?.savings.lifetime ?? 0)}
+            </Typography>
+            <Typography variant="caption" color="text.disabled">
+              {stats?.systemCostCad
+                ? `of $${stats.systemCostCad.toLocaleString('en-CA', { maximumFractionDigits: 0 })}`
+                : 'set your system cost in Settings'}
+              {stats?.paybackProgressPct != null ? ` · ${stats.paybackProgressPct.toFixed(1)}% paid back` : ''}
+            </Typography>
+          </Box>
+          <Box sx={{ height: 6, borderRadius: '4px', bgcolor: solar.surface.border, overflow: 'hidden', minWidth: 80 }}>
+            <Box
+              sx={{
+                width: `${Math.min(100, stats?.paybackProgressPct ?? 0)}%`,
+                minWidth: stats?.paybackProgressPct ? 2 : 0,
+                height: 6,
+                borderRadius: '4px',
+                bgcolor: solar.status.ok,
+              }}
+            />
+          </Box>
+          <Link
+            component={RouterLink}
+            to="/money/savings"
+            sx={{ font: `600 12px/1 ${solar.font.sans}`, color: solar.accent.link, justifySelf: 'start' }}
+          >
+            Money →
+          </Link>
+        </Box>
+      </Surface>
+
+      {/*
+        The sankey only when there is something to branch.
+
+        With a single flow it degenerates into one full-width bar saying exactly what
+        "Where it's going" says two cards above — which is what it did every day the car
+        was not plugged in. It comes back the moment there is a real split.
+      */}
+      {(evNowW > 0 || batteryNowW !== 0) && (
+        <EnergyFlow summary={summary} charger={charger ?? null} battery={battery ?? null} />
+      )}
+    </Box>
+  );
+}

@@ -1,0 +1,48 @@
+[Unit]
+Description=Solar Dashboard - local solar, EV and home energy monitoring
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/solar-dashboard
+ExecStart=/opt/solar-dashboard/solar-dashboard
+# `always`, not `on-failure`.
+#
+# on-failure leaves a clean exit alone, which sounds right and is not: a collector that
+# decides to stop is still a dashboard that has stopped collecting. Nothing here is ever
+# meant to exit on its own.
+Restart=always
+RestartSec=10
+User=solar
+
+# Restart it when it wedges, not only when it exits.
+#
+# The failure that prompted this looked nothing like a crash: readings stopped at 04:23
+# while the process stayed up, so systemd saw a healthy service and did nothing for three
+# and a half hours. The collector now checks in at the end of every poll cycle — success or
+# failure, since a DTU being switched off is not a reason to restart anything — and this is
+# how long systemd waits before concluding the loop is gone.
+#
+# 15 minutes is comfortably more than two 5-minute poll intervals. The DTU accepts one
+# connection at a time and a poll timing out is ordinary, so one missed cycle must never be
+# enough. WATCHDOG_SEC in apps/api/src/common/watchdog.ts carries the same number.
+WatchdogSec=900
+# Without this systemd discards the notification and the watchdog fires every 15 minutes
+# forever — a restart loop built out of a health feature.
+NotifyAccess=all
+Environment=PORT=3001
+# The same root-owned file the updater reads, so UPDATE_REPO is configured once.
+#
+# Without this the app cannot see the release feed while the updater can: setting
+# UPDATE_REPO exactly as documented left Settings → Updates reporting "No update source
+# configured" and checking nothing, while the systemd timer beside it was configured
+# correctly. One setting, two components, and only one of them could see it.
+#
+# The leading `-` makes the file optional, so a Docker or from-source install that has no
+# /etc/solar-dashboard still starts. Importing it is safe because the app keys its data
+# path off SOLAR_DATA_DIR, not the DATA_DIR this file sets for the updater.
+EnvironmentFile=-/etc/solar-dashboard/update.conf
+
+[Install]
+WantedBy=multi-user.target
